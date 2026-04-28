@@ -19,5 +19,5 @@ pyvenv.cfg
 !*.html
 !*.txt
 !*.md
-
+!*.css
 !.gitignore
