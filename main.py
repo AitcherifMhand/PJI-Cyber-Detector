@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import datetime
+import configparser
 
 app = FastAPI(title="SOC Cyber-Detector API", description="API avec PostgreSQL")
 
@@ -16,12 +17,15 @@ app.add_middleware(
 )
 
 # --- CONFIGURATION POSTGRESQL ---
+config = configparser.ConfigParser()
+config.read('db.config')
+
 DB_CONFIG = {
-    "dbname": "soc_db",
-    "user": "postgres",
-    "password": "mot_de_passe",
-    "host": "localhost",
-    "port": "5432"
+    "dbname": config['postgresql']['dbname'],
+    "user": config['postgresql']['user'],
+    "password": config['postgresql']['password'],
+    "host": config['postgresql']['host'],
+    "port": config['postgresql']['port']
 }
 
 class AlertEntry(BaseModel):
@@ -85,3 +89,18 @@ def get_alerts():
         return rows
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+pending_actions = []
+
+@app.post("/api/actions/kill/{pid}", status_code=200)
+def request_kill_process(pid: str):
+    """Reçoit la demande du frontend pour tuer un processus."""
+    pending_actions.append({"action": "kill", "pid": pid})
+    return {"status": "success", "message": f"Action de destruction du PID {pid} mise en attente."}
+
+@app.get("/api/actions/pending")
+def get_pending_actions():
+    """L'agent Osquery interrogera cette route pour savoir s'il doit agir."""
+    actions = pending_actions.copy()
+    pending_actions.clear() # Vider la file une fois récupérée par l'agent
+    return actions

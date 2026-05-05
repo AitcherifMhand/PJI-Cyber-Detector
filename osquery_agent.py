@@ -99,7 +99,29 @@ def check_shell_history_for_sql():
         msg = f"Instruction SQL détectée dans l'historique shell (uid {uid}): {cmd[:100]}"
         print(f"[!] SQL SHELL HISTORY : {cmd[:60]}...")
         send_alert("shell", uid, 0, msg)
+        
+def fetch_and_execute_actions():
+    """Interroge le backend pour voir si l'admin a cliqué sur le bouton Kill."""
+    try:
+        r = requests.get(f"{API_URL.replace('alerts/', 'actions/pending')}", timeout=5)
+        if r.status_code == 200:
+            actions = r.json()
+            for action in actions:
+                if action.get("action") == "kill":
+                    pid_to_kill = action.get("pid")
+                    print(f"[*] ORDRE REÇU DU BACKEND : Tuer le PID {pid_to_kill}")
+                    execute_kill(pid_to_kill)
+    except requests.exceptions.RequestException:
+        pass
 
+def execute_kill(pid):
+    """Exécute la commande système pour tuer le processus."""
+    try:
+        # Tente de tuer le processus proprement, puis par la force
+        subprocess.run(['kill', '-9', str(pid)], capture_output=True, text=True)
+        print(f"  [+] PID {pid} terminé avec succès.")
+    except Exception as e:
+        print(f"  [-] Échec lors de la destruction du PID {pid}: {e}")
 def agent_loop(interval_seconds=30):
     print(f"[*] Agent SOC démarré — cycle toutes les {interval_seconds}s.")
     while True:
@@ -108,6 +130,7 @@ def agent_loop(interval_seconds=30):
         check_suspicious_processes()
         check_shell_history_for_sql()
         print(f"[*] Prochain cycle dans {interval_seconds}s...")
+        fetch_and_execute_actions()
         time.sleep(interval_seconds)
 
 if __name__ == "__main__":

@@ -91,23 +91,51 @@ function renderTable() {
   const rows = data.slice(0, 50).map(a => {
     const sev = severity(a.port);
     const lbl = sevLabel(a.port);
+    
+    let actionBtn = '';
+    if (sev === 'danger' || sev === 'warning') {
+        actionBtn = `<button class="btn-primary" style="background:#E24B4A; padding:4px 8px; font-size:10px;" onclick="killProcess('${a.pid}', '${a.process_name}')">Kill ${a.pid}</button>`;
+    } else {
+        actionBtn = '<span style="color:var(--color-text-tertiary); font-size: 11px;">Aucune action</span>';
+    }
+
     return `<tr>
       <td style="color:var(--color-text-tertiary);font-family:var(--font-mono);">${fmt(a.timestamp)}</td>
       <td><code style="font-family:var(--font-mono);">${a.process_name}</code></td>
       <td style="color:var(--color-text-secondary);font-family:var(--font-mono);">${a.pid}</td>
       <td><span class="port-pill">:${a.port}</span></td>
       <td><span class="badge badge-${sev}">${lbl}</span></td>
-      <td style="color:var(--color-text-secondary);max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${a.alert_message}">${a.alert_message}</td>
+      <td style="color:var(--color-text-secondary);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${a.alert_message}">${a.alert_message}</td>
+      <td>${actionBtn}</td>
     </tr>`;
   }).join('');
   
   document.getElementById('alerts-body').innerHTML = `
     <table class="alert-table">
       <thead><tr>
-        <th>Horodatage</th><th>Processus</th><th>PID</th><th>Port</th><th>Sévérité</th><th>Message</th>
+        <th>Horodatage</th><th>Processus</th><th>PID</th><th>Port</th><th>Sévérité</th><th>Message</th><th>Action</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
+}
+
+async function killProcess(pid, processName) {
+  if (!confirm(`Êtes-vous sûr de vouloir tuer le processus ${processName} (PID: ${pid}) ?`)) return;
+  
+  try {
+    const r = await fetch(`http://localhost:8000/api/actions/kill/${pid}`, { 
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'}
+    });
+    
+    if (r.ok) {
+      alert(`Instruction envoyée pour tuer le PID ${pid}.`);
+    } else {
+      alert(`Erreur lors de l'envoi de l'instruction.`);
+    }
+  } catch(e) {
+    alert(`Impossible de joindre le backend : ${e.message}`);
+  }
 }
 
 function renderCharts() {
