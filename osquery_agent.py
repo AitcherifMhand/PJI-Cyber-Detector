@@ -20,6 +20,8 @@ SUSPICIOUS_PROCESSES = ["nc", "ncat", "netcat", "msfconsole", "python3", "bash"]
 
 SQL_KEYWORDS = ["SELECT", "INSERT", "DROP", "UPDATE", "DELETE"]
 
+SEEN_ALERTS = set()
+
 def execute_osquery(query):
     try:
         result = subprocess.run(
@@ -58,7 +60,7 @@ def send_log(process_name, pid, port, message, bytes_sent=0, query_text=""):
         print(f"  [!] Backend inaccessible : {e}")
 
 def check_ports():
-    """Cas d'usage 1 - Ports sensibles en écoute."""
+    """Cas d'usage 1 - Ports sensibles en écoute (Dédoublonné)."""
     query = """
         SELECT p.name, p.pid, l.port, l.address
         FROM listening_ports l
@@ -69,13 +71,16 @@ def check_ports():
         port = int(row.get('port', 0))
         if port in SENSITIVE_PORTS:
             name = row.get('name', 'inconnu')
-            pid = row.get('pid', 0)
-            msg = f"Processus {name} (PID {pid}) écoute sur le port sensible {port} ({SENSITIVE_PORTS[port]})"
-            print(f"[!] PORT SUSPECT : {msg}")
-            send_log(name, pid, port, msg)
+            pid = row.get('pid', 0)            
+            alert_key = f"port_{pid}_{port}"
+            if alert_key not in SEEN_ALERTS:
+                msg = f"Processus {name} (PID {pid}) écoute sur le port sensible {port} ({SENSITIVE_PORTS[port]})"
+                print(f"[!] PORT SUSPECT : {msg}")
+                send_log(name, pid, port, msg)
+                SEEN_ALERTS.add(alert_key)
 
 def check_suspicious_processes():
-    """Cas d'usage 1 — processus suspects lancés."""
+    """Cas d'usage 1 — processus suspects lancés (Dédoublonné)."""
     data = execute_osquery("""
         SELECT name, pid, cmdline
         FROM processes
@@ -85,12 +90,15 @@ def check_suspicious_processes():
         name = row.get('name', 'inconnu')
         pid = row.get('pid', '0')
         cmdline = row.get('cmdline', '')
-        msg = f"Processus suspect détecté : '{name}' (cmdline: {cmdline})."
-        print(f"[!] PROCESSUS SUSPECT : {name} (PID {pid})")
-        send_log(name, pid, 0, msg)
+        alert_key = f"proc_{pid}_{name}"
+        if alert_key not in SEEN_ALERTS:
+            msg = f"Processus suspect détecté : '{name}' (cmdline: {cmdline})."
+            print(f"[!] PROCESSUS SUSPECT : {name} (PID {pid})")
+            send_log(name, pid, 0, msg)
+            SEEN_ALERTS.add(alert_key)
 
 def check_shell_history_for_sql():
-    """Cas d'usage 2 — détection de commandes SQL dans l'historique shell."""
+    """Cas d'usage 2 & 3 — détection SQL ET Exfiltration (curl/wget)."""
     data = execute_osquery("""
         SELECT uid, command, history_file
         FROM shell_history
@@ -98,14 +106,19 @@ def check_shell_history_for_sql():
            OR command LIKE '%INSERT%'
            OR command LIKE '%DROP%'
            OR command LIKE '%DELETE%'
+           OR command LIKE '%curl%'
+           OR command LIKE '%wget%'
         LIMIT 50;
     """)
     for row in data:
         cmd = row.get('command', '')
-        uid = row.get('uid', '0')
-        msg = f"Instruction SQL détectée dans l'historique shell (uid {uid}): {cmd[:100]}"
-        print(f"[!] SQL SHELL HISTORY : {cmd[:60]}...")
-        send_log("shell", uid, 0, msg)
+        uid = row.get('uid', '0')        
+        alert_key = f"hist_{uid}_{cmd}"
+        if alert_key not in SEEN_ALERTS:
+            msg = f"Commande suspecte dans l'historique (uid {uid}): {cmd[:100]}"
+            print(f"[!] HISTORIQUE SUSPECT : {cmd[:60]}...")
+            send_log("shell", uid, 0, msg)
+            SEEN_ALERTS.add(alert_key)
 def check_network_traffic():
     """Surveillance basique du trafic réseau via netstat ou osquery (socket_events requis)."""
     query = """

@@ -79,12 +79,15 @@ def receive_log(log: LogEntry):
     if log.port in [4444, 1337] or log.process_name.lower() in ["nc", "ncat", "netcat", "msfconsole"]:
         is_anomaly = True
         remediation = "Kill Process"
-        
-    # Règle 2: Détection de commandes SQL suspectes (Exfiltration/Destruction)
-    sql_upper = log.alert_message.upper()
-    if "SELECT" in sql_upper or "DROP" in sql_upper or "DELETE" in sql_upper:
+                
+    # Règle 2: Détection de commandes shell suspectes (SQL / Exfiltration)
+    msg_upper = log.alert_message.upper()
+    if "SELECT" in msg_upper or "DROP" in msg_upper or "DELETE" in msg_upper:
         is_anomaly = True
         remediation = "Vérifier Injection / Isoler Machine"
+    elif "CURL" in msg_upper or "WGET" in msg_upper:
+        is_anomaly = True
+        remediation = "Vérifier Exfiltration / Bloquer IP"
         
     # Règle 3: Exfiltration réseau massive
     if log.bytes_sent > 50000:
