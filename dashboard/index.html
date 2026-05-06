@@ -1,120 +1,103 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="fr">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SOC Cyber-Detector</title>
-  <link rel="stylesheet" href="style.css">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-  <script src="script.js" defer></script>
-</head>
-<body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SOC Cyber-Detector</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+    <script src="script.js" defer></script>
+  </head>
 
-  <h2 class="sr-only" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);">SOC Cyber-Detector dashboard — alertes de sécurité en temps réel</h2>
+  <body>
+    <div class="dash">
+      <header class="top-bar">
+        <div class="logo">
+          <div class="logo-dot"></div>
+          <div>
+            <h1 class="logo-title">SOC Cyber-Detector</h1>
+          </div>
+        </div>
+        <div class="top-actions">
+          <div class="status-badge" id="api-status">
+            <span class="status-dot red" id="status-dot"></span>
+            <span id="status-text">Connexion...</span>
+          </div>
+          <button class="btn-primary" onclick="refreshDashboard()">
+            ↻ Actualiser
+          </button>
+        </div>
+      </header>
 
-  <div class="dash">
-    <div class="top-bar">
-      <div class="logo">
-        <div class="logo-dot"></div>
-        <div>
-          <div class="logo-title">SOC Cyber-Detector</div>
-          <div class="logo-sub">Surveillance des ports &amp; processus</div>
+      <section class="metrics" id="metrics-container">
+        <div class="metric-card">
+          <div class="metric-label">Total alertes</div>
+          <div class="metric-value" id="m-total">—</div>
+          <div class="metric-sub">Toutes sources confondues</div>
         </div>
-      </div>
-      <div class="top-actions">
-        <div class="status-bar" id="api-status" style="padding:6px 10px;">
-          <span class="status-dot red" id="status-dot"></span>
-          <span id="status-text">Connexion...</span>
+        <div class="metric-card">
+          <div class="metric-label">Anomalies détectées</div>
+          <div class="metric-value danger" id="m-anomalies">—</div>
+          <div class="metric-sub">Règles heuristiques & ML</div>
         </div>
-        <button class="btn-primary" onclick="fetchAlerts()">↻ Actualiser</button>
-      </div>
+        <div class="metric-card">
+          <div class="metric-label">Hôtes surveillés</div>
+          <div class="metric-value warning" id="m-hosts">—</div>
+          <div class="metric-sub">Agents actifs</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Dernière remédiation</div>
+          <div
+            class="metric-value ok"
+            id="m-last-action"
+            style="font-size: 14px"
+          >
+            —
+          </div>
+          <div class="metric-sub" id="m-last-time"></div>
+        </div>
+      </section>
+
+      <section class="grid-2">
+        <div class="panel">
+          <div class="section-title">Répartition par hôte</div>
+          <div class="chart-wrap"><canvas id="chartHosts"></canvas></div>
+        </div>
+        <div class="panel">
+          <div class="section-title">Anomalies / heure</div>
+          <div class="chart-wrap"><canvas id="chartTimeline"></canvas></div>
+        </div>
+      </section>
+
+      <section class="alerts-panel">
+        <div class="alert-header">
+          <h2 class="section-title" style="margin: 0">
+            Journal des alertes & remédiations
+          </h2>
+          <div class="filter-group">
+            <button class="filter-btn active" onclick="setFilter('Tous', this)">
+              Tous
+            </button>
+            <button class="filter-btn" onclick="setFilter('anomalie', this)">
+              Anomalies
+            </button>
+            <button class="filter-btn" onclick="setFilter('port', this)">
+              Ports suspects
+            </button>
+          </div>
+        </div>
+        <div id="alerts-body">
+          <div class="empty-state">Chargement des alertes...</div>
+        </div>
+      </section>
+
+      <footer class="status-bar">
+        <span
+          ><span class="status-dot green"></span>API :
+          <code>http://localhost:8000</code></span
+        >
+        <span id="last-refresh">—</span>
+      </footer>
     </div>
-
-    <div class="metrics">
-      <div class="metric-card">
-        <div class="metric-label">Total alertes</div>
-        <div class="metric-value" id="m-total">—</div>
-        <div class="metric-sub">depuis le début</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-label">Ports critiques</div>
-        <div class="metric-value danger" id="m-critical">—</div>
-        <div class="metric-sub">4444 / Metasploit</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-label">Ports sensibles</div>
-        <div class="metric-value warning" id="m-sensitive">—</div>
-        <div class="metric-sub">SSH, MySQL, HTTP alt</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-label">Processus uniques</div>
-        <div class="metric-value ok" id="m-procs">—</div>
-        <div class="metric-sub">détectés</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-label">Dernière alerte</div>
-        <div class="metric-value" id="m-last" style="font-size:14px;margin-top:4px;">—</div>
-        <div class="metric-sub" id="m-last-sub"></div>
-      </div>
-    </div>
-
-    <div class="grid-2">
-      <div class="panel">
-        <div class="section-title">Alertes par port</div>
-        <div class="chart-wrap"><canvas id="chartPort" role="img" aria-label="Répartition des alertes par port réseau">Données en cours de chargement.</canvas></div>
-      </div>
-      <div class="panel">
-        <div class="section-title">Alertes dans le temps</div>
-        <div class="chart-wrap"><canvas id="chartTime" role="img" aria-label="Nombre d'alertes par heure">Données en cours de chargement.</canvas></div>
-      </div>
-    </div>
-
-    <div class="alerts-panel">
-      <div class="alert-header">
-        <div class="section-title" style="margin:0">Journal des alertes</div>
-        <div class="filter-group">
-          <button class="filter-btn active" onclick="setFilter('all',this)">Tous</button>
-          <button class="filter-btn" onclick="setFilter('4444',this)">:4444</button>
-          <button class="filter-btn" onclick="setFilter('22',this)">SSH</button>
-          <button class="filter-btn" onclick="setFilter('3306',this)">MySQL</button>
-        </div>
-      </div>
-      <div id="alerts-body">
-        <div class="loading-row">Chargement...</div>
-      </div>
-    </div>
-
-    <div class="osquery-form">
-      <div class="section-title" style="margin-bottom:12px">Injecter une alerte manuellement (test)</div>
-      <div class="form-row">
-        <div>
-          <div class="form-label">Processus</div>
-          <input class="form-input" id="f-proc" value="sshd" />
-        </div>
-        <div>
-          <div class="form-label">PID</div>
-          <input class="form-input" id="f-pid" value="1337" />
-        </div>
-      </div>
-      <div class="form-row">
-        <div>
-          <div class="form-label">Port</div>
-          <input class="form-input" id="f-port" type="number" value="22" />
-        </div>
-        <div>
-          <div class="form-label">Message</div>
-          <input class="form-input" id="f-msg" value="Processus sshd écoute sur un port sensible (SSH)." />
-        </div>
-      </div>
-      <button class="btn-primary" id="btn-send" onclick="sendAlert()">Envoyer l'alerte au backend →</button>
-      <span id="send-status" style="font-size:11px;margin-left:12px;color:var(--color-text-secondary)"></span>
-    </div>
-
-    <div class="status-bar">
-      <span><span class="status-dot green"></span>API cible : <code style="font-size:11px">http://localhost:8000</code></span>
-      <span id="last-refresh" style="color:var(--color-text-tertiary)"></span>
-    </div>
-  </div>
-
-</body>
+  </body>
 </html>
