@@ -3,9 +3,11 @@ import json
 import sys
 import time
 import requests
+import socket
+import argparse
 
-# Configuration
-API_URL = "http://localhost:8000/api/alerts/"
+API_URL = ""
+HOSTNAME = ""
 
 SENSITIVE_PORTS = {
     22: "SSH",
@@ -34,38 +36,43 @@ def execute_osquery(query):
         print("[Erreur] Réponse JSON invalide.")
         return []
 
-def send_alert(process_name, pid, port, message):
+def send_log(process_name, pid, port, message, bytes_sent=0, query_text=""):
+    """Envoie un log au backend."""
     payload = {
+        "hostname": HOSTNAME,
         "process_name": str(process_name),
-        "pid": str(pid),
+        "pid": int(pid),
         "port": int(port),
-        "alert_message": message
+        "alert_message": message,
+        "bytes_sent": bytes_sent,
+        "query_text": query_text
     }
     try:
-        r = requests.post(API_URL, json=payload, timeout=5)
+        r = requests.post(f"{API_URL}/logs/", json=payload, timeout=5)
         if r.status_code == 201:
-            print(f"  [+] Alerte envoyée (port {port}, {process_name})")
+            resp = r.json()
+            print(f"  [+] Log envoyé → anomalie={resp.get('is_anomaly')}, remédiation={resp.get('remediation')}")
         else:
-            print(f"  [-] Échec envoi : {r.status_code}")
-    except requests.exceptions.RequestException as e:
+            print(f"  [-] Erreur HTTP {r.status_code}")
+    except Exception as e:
         print(f"  [!] Backend inaccessible : {e}")
 
 def check_ports():
-    """Cas d'usage 1 — ports sensibles en écoute."""
-    data = execute_osquery("""
-        SELECT p.name, p.pid, l.port
+    """Cas d'usage 1 - Ports sensibles en écoute."""
+    query = """
+        SELECT p.name, p.pid, l.port, l.address
         FROM listening_ports l
         JOIN processes p ON l.pid = p.pid
-        WHERE l.port != 0;
-    """)
-    for row in data:
+        WHERE l.port != 0
+    """
+    for row in execute_osquery(query):
         port = int(row.get('port', 0))
         if port in SENSITIVE_PORTS:
             name = row.get('name', 'inconnu')
-            pid = row.get('pid', '0')
-            msg = f"Processus '{name}' en écoute sur port sensible ({SENSITIVE_PORTS[port]})."
-            print(f"[!] PORT SENSIBLE : {name} (PID {pid}) → :{port}")
-            send_alert(name, pid, port, msg)
+            pid = row.get('pid', 0)
+            msg = f"Processus {name} (PID {pid}) écoute sur le port sensible {port} ({SENSITIVE_PORTS[port]})"
+            print(f"[!] PORT SUSPECT : {msg}")
+            send_log(name, pid, port, msg)
 
 def check_suspicious_processes():
     """Cas d'usage 1 — processus suspects lancés."""
@@ -80,7 +87,7 @@ def check_suspicious_processes():
         cmdline = row.get('cmdline', '')
         msg = f"Processus suspect détecté : '{name}' (cmdline: {cmdline})."
         print(f"[!] PROCESSUS SUSPECT : {name} (PID {pid})")
-        send_alert(name, pid, 0, msg)
+        send_log(name, pid, 0, msg)
 
 def check_shell_history_for_sql():
     """Cas d'usage 2 — détection de commandes SQL dans l'historique shell."""
@@ -98,12 +105,29 @@ def check_shell_history_for_sql():
         uid = row.get('uid', '0')
         msg = f"Instruction SQL détectée dans l'historique shell (uid {uid}): {cmd[:100]}"
         print(f"[!] SQL SHELL HISTORY : {cmd[:60]}...")
-        send_alert("shell", uid, 0, msg)
-        
+        send_log("shell", uid, 0, msg)
+def check_network_traffic():
+    """Surveillance basique du trafic réseau via netstat ou osquery (socket_events requis)."""
+    query = """
+        SELECT s.pid, p.name, SUM(s.bytes_sent) as total_bytes
+        FROM socket_events s
+        JOIN processes p ON s.pid = p.pid
+        WHERE s.bytes_sent > 0
+        GROUP BY s.pid, p.name
+        HAVING SUM(s.bytes_sent) > 50000
+    """
+    for row in execute_osquery(query):
+        pid = row.get('pid', 0)
+        name = row.get('name', 'inconnu')
+        total_bytes = row.get('total_bytes', 0)
+        msg = f"Trafic réseau élevé : {total_bytes} octets envoyés par {name} (PID {pid})"
+        print(f"[!] TRAFIC ANORMAL : {msg}")
+        send_log(name, pid, 0, msg, bytes_sent=total_bytes)   
+             
 def fetch_and_execute_actions():
     """Interroge le backend pour voir si l'admin a cliqué sur le bouton Kill."""
     try:
-        r = requests.get(f"{API_URL.replace('alerts/', 'actions/pending')}", timeout=5)
+        r = requests.get(f"{API_URL}/actions/pending", timeout=5) 
         if r.status_code == 200:
             actions = r.json()
             for action in actions:
@@ -129,12 +153,40 @@ def agent_loop(interval_seconds=30):
         check_ports()
         check_suspicious_processes()
         check_shell_history_for_sql()
+        check_network_traffic()
         print(f"[*] Prochain cycle dans {interval_seconds}s...")
         fetch_and_execute_actions()
         time.sleep(interval_seconds)
 
 if __name__ == "__main__":
+    
+    parser = argparse.ArgumentParser(description="Agent de détection osquery pour le SOC")   
+    parser.add_argument(
+        "--api-url", 
+        type=str, 
+        default="http://localhost:8000/api", 
+        help="URL de base de l'API (défaut: http://localhost:8000/api/alerts/)"
+    )   
+    parser.add_argument(
+        "--hostname", 
+        type=str, 
+        default=socket.gethostname(), 
+        help=f"Nom d'hôte identifiant cet agent (défaut: {socket.gethostname()})"
+    ) 
+    parser.add_argument(
+        "--interval", 
+        type=int, 
+        default=30, 
+        help="Intervalle entre chaque vérification en secondes (défaut: 30)"
+    )
+    args = parser.parse_args()
+
+    API_URL = args.api_url
+    HOSTNAME = args.hostname
+
+    print(f"[*] Configuration : API={API_URL} | HOST={HOSTNAME} | INTERVALLE={args.interval}s")
+
     try:
-        agent_loop(interval_seconds=30)
+        agent_loop(interval_seconds=args.interval)
     except KeyboardInterrupt:
         print("\n[*] Agent arrêté.")
