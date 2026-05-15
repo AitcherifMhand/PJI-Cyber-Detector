@@ -168,7 +168,7 @@ def agent_loop(interval_seconds=30):
         check_shell_history_for_sql()
         check_network_traffic()
         print(f"[*] Prochain cycle dans {interval_seconds}s...")
-        fetch_and_execute_actions()
+        #fetch_and_execute_actions()
         time.sleep(interval_seconds)
 
 if __name__ == "__main__":

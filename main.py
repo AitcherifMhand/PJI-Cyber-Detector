@@ -5,8 +5,10 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import datetime
 import configparser
+import logging
+import json
+import requests
 from typing import Optional
-
 app = FastAPI(title="SOC Cyber-Detector API", description="API avec PostgreSQL")
 
 app.add_middleware(
@@ -17,6 +19,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- WAZUH CONFIGURATION ---
+WAZUH_API_URL = "https://<WAZUH_SERVER_IP>:55000"
+WAZUH_API_USER = "wazuh-wui"
+WAZUH_API_PASS = "wazuh_api_password"
+log_file_path = '/var/log/soc_alerts.json'
+logger = logging.getLogger("SOC_Logger")
+logger.setLevel(logging.INFO)
+handler = logging.FileHandler(log_file_path)
+formatter = logging.Formatter('%(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 # --- CONFIGURATION POSTGRESQL ---
 config = configparser.ConfigParser()
 config.read('db.config')
@@ -101,21 +114,25 @@ def receive_log(log: LogEntry):
             INSERT INTO alerts (timestamp, hostname, process_name, pid, port, alert_message, is_anomaly, remediation_action)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ''', (
-            datetime.datetime.now(),
-            log.hostname, 
-            log.process_name, 
-            log.pid, 
-            log.port, 
-            log.alert_message, 
-            is_anomaly, 
-            remediation
+            datetime.datetime.now(), log.hostname, log.process_name, log.pid, log.port, log.alert_message, is_anomaly, remediation
         ))
         conn.commit()
         cursor.close()
         conn.close()
-        return {"status": "success", "is_anomaly": is_anomaly, "remediation": remediation}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"PostgreSQL Error: {str(e)}")
+
+    # Enregistrement dans le fichier JSON (Pour ingestion par Wazuh)
+    log_dict = log.dict()
+    log_dict["timestamp"] = datetime.datetime.utcnow().isoformat()
+    log_dict["is_anomaly"] = is_anomaly
+    log_dict["remediation_action"] = remediation
+    log_dict["soc_source"] = "osquery_agent"
+    
+    logger.info(json.dumps(log_dict))
+
+    return {"status": "success", "is_anomaly": is_anomaly, "remediation": remediation}
+
 @app.get("/api/alerts/")
 def get_alerts(limit: int = 100):
     try:
@@ -149,13 +166,49 @@ def get_stats():
         return {"total_alerts": total, "anomalies": anomalies, "unique_hosts": hosts}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+def get_wazuh_token():
+    auth_url = f"{WAZUH_API_URL}/security/user/authenticate"
+    resp = requests.post(auth_url, auth=(WAZUH_API_USER, WAZUH_API_PASS), verify=False)
+    if resp.status_code == 200:
+        return resp.json()['data']['token']
+    raise Exception("Failed to authenticate with Wazuh API")
+
+def get_agent_id(hostname, token):
+    url = f"{WAZUH_API_URL}/agents?q=name={hostname}"
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(url, headers=headers, verify=False)
+    if resp.status_code == 200 and resp.json()['data']['affected_items']:
+        return resp.json()['data']['affected_items'][0]['id']
+    return None
 
 @app.post("/api/actions/kill/{pid}", status_code=200)
 def request_kill_process(pid: str, hostname: str = ""):
-    """Reçoit la demande du frontend pour tuer un processus."""
-    pending_actions.append({"action": "kill", "pid": pid, "hostname": hostname})
-    return {"status": "success", "message": f"Action de destruction du PID {pid} sur {hostname} mise en attente."}
+    """Déclenche la remédiation Wazuh (Active Response) au lieu de mettre en file d'attente."""
+    try:
+        token = get_wazuh_token()
+        agent_id = get_agent_id(hostname, token)
+        
+        if not agent_id:
+            raise HTTPException(status_code=404, detail=f"Wazuh Agent introuvable pour {hostname}")
 
+        # Déclenchement de l'Active Response
+        ar_url = f"{WAZUH_API_URL}/active-response?agents_list={agent_id}"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {
+            "command": "custom-kill",
+            "custom": True,
+            "arguments": [pid]
+        }
+        
+        resp = requests.put(ar_url, headers=headers, json=payload, verify=False)
+        if resp.status_code == 200:
+            return {"status": "success", "message": f"Active response envoyée à l'agent {agent_id}"}
+        else:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            
+    except Exception as e:
+         raise HTTPException(status_code=500, detail=str(e))
 @app.get("/api/actions/pending")
 def get_pending_actions():
     """L'agent Osquery interrogera cette route pour savoir s'il doit agir."""
