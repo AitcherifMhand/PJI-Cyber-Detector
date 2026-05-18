@@ -267,3 +267,24 @@ body {
     grid-template-columns: 1fr;
   }
 }
+.row-resolved td {
+  opacity: 0.6;
+  background: rgba(16, 185, 129, 0.05) !important;
+}
+
+.row-resolved .alert-msg {
+  text-decoration: line-through;
+  color: var(--text-secondary);
+}
+
+.badge-resolved {
+  background: var(--green) !important;
+  color: #fff !important;
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.4);
+}
+
+.btn-disabled {
+  background: var(--border);
+  color: var(--text-secondary);
+  cursor: not-allowed;
+}

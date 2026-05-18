@@ -8,6 +8,7 @@ import configparser
 import logging
 import json
 import requests
+#from ml_module import CyberAnomalyDetector
 from typing import Optional
 app = FastAPI(title="SOC Cyber-Detector API", description="API avec PostgreSQL")
 
@@ -28,7 +29,7 @@ try:
     WAZUH_API_PASS = wazuh_config['wazuh']['password']
 except KeyError as e:
     print(f"[ERREUR] Configuration Wazuh manquante dans wazuh.config: {e}")
-log_file_path = '/var/log/soc_alerts.json'
+log_file_path = 'soc_alerts.json'
 logger = logging.getLogger("SOC_Logger")
 logger.setLevel(logging.INFO)
 handler = logging.FileHandler(log_file_path)
@@ -73,7 +74,7 @@ def init_db():
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 hostname VARCHAR(255),
                 process_name VARCHAR(255),
-                pid VARCHAR(50),
+                pid INTEGER,
                 port INTEGER,
                 alert_message TEXT,
                 is_anomaly BOOLEAN,
@@ -142,25 +143,38 @@ def receive_log(log: LogEntry):
 
     return {"status": "success", "is_anomaly": is_anomaly, "remediation": remediation}
 
-def check_osv_vulnerability(package_name, version, ecosystem):
-    """Interroge l'API Google OSV pour trouver des CVE sur un package spécifique."""
-    url = "https://api.osv.dev/v1/query"
-    payload = {
-        "version": version,
-        "package": {
-            "name": package_name,
-            "ecosystem": ecosystem 
-        }
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            if "vulns" in data:
-                return [vuln.get("id") for vuln in data["vulns"]]
-    except Exception as e:
-        print(f"[ERREUR] API OSV ({package_name}) : {e}")
-    return []
+def check_osv_vulnerabilities_batch(packages):
+    """Interroge l'API Google OSV en utilisant l'endpoint /v1/querybatch avec découpage par lots."""
+    url = "https://api.osv.dev/v1/querybatch"
+    queries = []
+    for pkg in packages:
+        if pkg.get("name") and pkg.get("version"):
+            queries.append({
+                "version": pkg.get("version"),
+                "package": {
+                    "name": pkg.get("name"),
+                    "ecosystem": pkg.get("ecosystem", "PyPI")
+                }
+            })
+            
+    all_results = []
+    chunk_size = 100
+    
+    for i in range(0, len(queries), chunk_size):
+        chunk = {"queries": queries[i:i + chunk_size]}
+        try:
+            resp = requests.post(url, json=chunk, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                all_results.extend(data.get("results", []))
+            else:
+                logger.error(f"[ERREUR] API OSV HTTP {resp.status_code}")
+                all_results.extend([{} for _ in range(len(chunk["queries"]))])
+        except Exception as e:
+            logger.error(f"[ERREUR] Exception OSV API: {e}")
+            all_results.extend([{} for _ in range(len(chunk["queries"]))])
+            
+    return queries, all_results
 
 @app.post("/api/inventory/", status_code=200)
 def receive_inventory(inventory: InventoryEntry):
@@ -168,18 +182,17 @@ def receive_inventory(inventory: InventoryEntry):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    for pkg in inventory.packages:
-        name = pkg.get("name")
-        version = pkg.get("version")
-        ecosystem = pkg.get("ecosystem", "PyPI") # Valeur par défaut si non fourni
+    queries, results = check_osv_vulnerabilities_batch(inventory.packages)
 
-        if not name or not version:
-            continue
-
-        vulns = check_osv_vulnerability(name, version, ecosystem)
-
-        if vulns:
+    for i, result in enumerate(results):
+        if "vulns" in result:
+            vulns = [v.get("id") for v in result["vulns"]]
             total_vulns += len(vulns)
+            
+            name = queries[i]["package"]["name"]
+            version = queries[i]["version"]
+            ecosystem = queries[i]["package"]["ecosystem"]
+            
             vuln_list = ", ".join(vulns[:3]) 
             msg = f"Alerte Vulnérabilité ({ecosystem}) : {name} v{version} est vulnérable ({vuln_list})"
 
@@ -206,18 +219,49 @@ def receive_inventory(inventory: InventoryEntry):
 
     return {"status": "success", "vulnerabilities": total_vulns}
 
+def get_wazuh_alerts(token, limit=100):
+    url = f"{WAZUH_API_URL}/alerts/history?limit={limit}"
+    headers = {"Authorization": f"Bearer {token}"}    
+    resp = requests.get(url, headers=headers, verify=False) 
+    if resp.status_code == 200:
+        return resp.json()['data']['affected_items']
+    return []
+
 @app.get("/api/alerts/")
 def get_alerts(limit: int = 100):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor) 
-        cursor.execute("SELECT * FROM alerts ORDER BY timestamp DESC LIMIT %s", (limit,))
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return rows
+        token = get_wazuh_token()
+        wazuh_alerts = get_wazuh_alerts(token, limit)
+        formatted_alerts = []
+        for alert in wazuh_alerts:
+            original_log = alert.get('data', {}) 
+            
+            formatted_alerts.append({
+                "id": alert.get('id'),
+                "timestamp": alert.get('timestamp'),
+                "hostname": alert.get('agent', {}).get('name', 'Unknown'),
+                "process_name": original_log.get('process_name', 'Unknown'),
+                "pid": original_log.get('pid', '0'),
+                "port": original_log.get('port', 0),
+                "alert_message": alert.get('rule', {}).get('description', 'Unknown Alert'),
+                "is_anomaly": original_log.get('is_anomaly', False),
+                "remediation_action": original_log.get('remediation_action', ''),
+                "rule_level": alert.get('rule', {}).get('level', 0)
+            })
+        return formatted_alerts
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error fetching from Wazuh: {e}. Falling back to DB.")
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor) 
+            cursor.execute("SELECT * FROM alerts ORDER BY timestamp DESC LIMIT %s", (limit,))
+            rows = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            return rows
+        except Exception as db_e:
+            raise HTTPException(status_code=500, detail=str(db_e))
 
 @app.get("/api/stats/")
 def get_stats():
@@ -256,32 +300,36 @@ def get_agent_id(hostname, token):
     return None
 
 @app.post("/api/actions/kill/{pid}", status_code=200)
-def request_kill_process(pid: str, hostname: str = ""):
-    """Déclenche la remédiation Wazuh (Active Response) au lieu de mettre en file d'attente."""
+def request_kill_process(pid: int, hostname: str = ""):
     try:
         token = get_wazuh_token()
         agent_id = get_agent_id(hostname, token)
         
         if not agent_id:
-            raise HTTPException(status_code=404, detail=f"Wazuh Agent introuvable pour {hostname}")
+            logger.warning(f"[WAZUH] Agent introuvable pour {hostname}. Remédiation ignorée.")
+            return {"status": "failed", "message": f"Agent Wazuh introuvable pour {hostname}"}
 
-        # Déclenchement de l'Active Response
         ar_url = f"{WAZUH_API_URL}/active-response?agents_list={agent_id}"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         payload = {
             "command": "custom-kill",
             "custom": True,
-            "arguments": [pid]
+            "arguments": [str(pid)] 
         }
-        
-        resp = requests.put(ar_url, headers=headers, json=payload, verify=False)
+        resp = requests.put(ar_url, headers=headers, json=payload, verify=False, timeout=5)
         if resp.status_code == 200:
             return {"status": "success", "message": f"Active response envoyée à l'agent {agent_id}"}
         else:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            logger.error(f"[WAZUH] Erreur Active Response (HTTP {resp.status_code}): {resp.text}")
+            return {"status": "failed", "message": f"Wazuh a refusé l'ordre (Erreur {resp.status_code})"}
             
+    except requests.exceptions.RequestException as e:
+        logger.error(f"[WAZUH] Impossible de joindre le serveur Wazuh : {e}")
+        return {"status": "failed", "message": "Le serveur Wazuh est actuellement injoignable."}
     except Exception as e:
-         raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"[WAZUH] Exception inattendue lors de la remédiation : {e}")
+        return {"status": "failed", "message": "Erreur interne lors de la communication avec Wazuh."}
+    
 @app.get("/api/actions/pending")
 def get_pending_actions():
     """L'agent Osquery interrogera cette route pour savoir s'il doit agir."""

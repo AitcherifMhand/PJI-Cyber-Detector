@@ -47,6 +47,7 @@ function setFilter(filter, btn) {
 function renderAlertsTable() {
   const tbody = document.getElementById("alerts-body");
   let data = allAlerts;
+
   if (currentFilter === "anomalie")
     data = allAlerts.filter((a) => a.is_anomaly);
   else if (currentFilter === "port")
@@ -60,21 +61,29 @@ function renderAlertsTable() {
 
   const rows = data
     .slice(0, 30)
-    .map(
-      (a) => `
-        <tr>
+    .map((a) => {
+      const isResolved = a.resolved;
+
+      return `
+        <tr class="${isResolved ? "row-resolved" : ""}" id="row-${a.pid}">
             <td>${new Date(a.timestamp).toLocaleString("fr-FR")}</td>
             <td><strong>${a.hostname}</strong></td>
             <td>${a.process_name}</td>
             <td>PID ${a.pid}</td>
             <td><span class="badge badge-port">:${a.port}</span></td>
-            <td style="max-width:200px; overflow:hidden; text-overflow:ellipsis;" title="${a.alert_message}">${a.alert_message}</td>
-            <td><span class="badge ${a.is_anomaly ? "badge-anomaly" : "badge-normal"}">${a.is_anomaly ? "Anomalie" : "Normal"}</span></td>
+            <td class="alert-msg" style="max-width:200px; overflow:hidden; text-overflow:ellipsis;" title="${a.alert_message}">${a.alert_message}</td>
+            <td>
+                <span id="badge-${a.pid}" class="badge ${isResolved ? "badge-resolved" : a.is_anomaly ? "badge-anomaly" : "badge-normal"}">
+                    ${isResolved ? "✓ Mitigé" : a.is_anomaly ? "Anomalie" : "Normal"}
+                </span>
+            </td>
             <td>${a.remediation_action || "—"}</td>
-            <td>${a.is_anomaly ? `<button class="btn-primary" style="font-size:11px; padding:4px 8px;" onclick="killProcess('${a.pid}', '${a.hostname}')">Kill</button>` : ""}</td>
+            <td>
+                ${a.is_anomaly ? `<button id="btn-${a.pid}" class="btn-primary ${isResolved ? "btn-disabled" : ""}" style="font-size:11px; padding:4px 8px;" onclick="killProcess('${a.pid}', '${a.hostname}')" ${isResolved ? "disabled" : ""}>${isResolved ? "Résolu" : "Kill"}</button>` : ""}
+            </td>
         </tr>
-    `,
-    )
+    `;
+    })
     .join("");
 
   tbody.innerHTML = `
@@ -87,20 +96,57 @@ function renderAlertsTable() {
 }
 
 async function killProcess(pid, hostname) {
-  if (!confirm(`Kill PID ${pid} sur ${hostname} ?`)) return;
+  if (
+    !confirm(
+      `Confirmer la destruction du processus suspect PID ${pid} sur ${hostname} ?`,
+    )
+  )
+    return;
+
+  const btn = document.getElementById(`btn-${pid}`);
+  btn.textContent = "En cours...";
+  btn.classList.add("btn-disabled");
+
   try {
     const resp = await fetch(
       `${API_BASE}/api/actions/kill/${pid}?hostname=${hostname}`,
       { method: "POST" },
     );
+
     if (resp.ok) {
-      alert(`Ordre envoyé pour ${pid}`);
-      document.getElementById("m-last-action").textContent = `Kill PID ${pid}`;
+      const targetAlert = allAlerts.find((a) => a.pid == pid);
+      if (targetAlert) targetAlert.resolved = true;
+
+      document.getElementById(`row-${pid}`).classList.add("row-resolved");
+
+      const badge = document.getElementById(`badge-${pid}`);
+      badge.className = "badge badge-resolved";
+      badge.textContent = "✓ Mitigé";
+
+      btn.textContent = "Résolu";
+      btn.disabled = true;
+
+      document.getElementById("m-last-action").textContent =
+        `PID ${pid} neutralisé`;
       document.getElementById("m-last-time").textContent =
         new Date().toLocaleTimeString();
+
+      let currentAnomalies = parseInt(
+        document.getElementById("m-anomalies").textContent,
+      );
+      if (!isNaN(currentAnomalies) && currentAnomalies > 0) {
+        document.getElementById("m-anomalies").textContent =
+          currentAnomalies - 1;
+      }
+    } else {
+      throw new Error("API refusée");
     }
   } catch (e) {
-    alert("Erreur");
+    alert(
+      `Échec de la remédiation pour le PID ${pid}. Vérifiez la connexion Wazuh.`,
+    );
+    btn.textContent = "Kill";
+    btn.classList.remove("btn-disabled");
   }
 }
 
