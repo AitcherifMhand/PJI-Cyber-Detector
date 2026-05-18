@@ -20,9 +20,14 @@ app.add_middleware(
 )
 
 # --- WAZUH CONFIGURATION ---
-WAZUH_API_URL = "https://<WAZUH_SERVER_IP>:55000"
-WAZUH_API_USER = "wazuh-wui"
-WAZUH_API_PASS = "wazuh_api_password"
+wazuh_config = configparser.ConfigParser()
+wazuh_config.read('wazuh.config')
+try:
+    WAZUH_API_URL = wazuh_config['wazuh']['url']
+    WAZUH_API_USER = wazuh_config['wazuh']['user']
+    WAZUH_API_PASS = wazuh_config['wazuh']['password']
+except KeyError as e:
+    print(f"[ERREUR] Configuration Wazuh manquante dans wazuh.config: {e}")
 log_file_path = '/var/log/soc_alerts.json'
 logger = logging.getLogger("SOC_Logger")
 logger.setLevel(logging.INFO)
@@ -41,7 +46,10 @@ DB_CONFIG = {
     "host": config['postgresql']['host'],
     "port": config['postgresql']['port']
 }
-
+class InventoryEntry(BaseModel):
+    hostname: str
+    packages: list[dict] # Liste de dictionnaires contenant 'name' et 'version' et 'ecosystem'
+    
 class LogEntry(BaseModel):
     hostname: str
     process_name: str
@@ -50,6 +58,7 @@ class LogEntry(BaseModel):
     alert_message: str
     bytes_sent: Optional[int] = 0
     query_text: Optional[str] = ""
+    
 def get_db_connection():
     """Crée et retourne une connexion à PostgreSQL."""
     return psycopg2.connect(**DB_CONFIG)
@@ -132,6 +141,70 @@ def receive_log(log: LogEntry):
     logger.info(json.dumps(log_dict))
 
     return {"status": "success", "is_anomaly": is_anomaly, "remediation": remediation}
+
+def check_osv_vulnerability(package_name, version, ecosystem):
+    """Interroge l'API Google OSV pour trouver des CVE sur un package spécifique."""
+    url = "https://api.osv.dev/v1/query"
+    payload = {
+        "version": version,
+        "package": {
+            "name": package_name,
+            "ecosystem": ecosystem 
+        }
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if "vulns" in data:
+                return [vuln.get("id") for vuln in data["vulns"]]
+    except Exception as e:
+        print(f"[ERREUR] API OSV ({package_name}) : {e}")
+    return []
+
+@app.post("/api/inventory/", status_code=200)
+def receive_inventory(inventory: InventoryEntry):
+    total_vulns = 0
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    for pkg in inventory.packages:
+        name = pkg.get("name")
+        version = pkg.get("version")
+        ecosystem = pkg.get("ecosystem", "PyPI") # Valeur par défaut si non fourni
+
+        if not name or not version:
+            continue
+
+        vulns = check_osv_vulnerability(name, version, ecosystem)
+
+        if vulns:
+            total_vulns += len(vulns)
+            vuln_list = ", ".join(vulns[:3]) 
+            msg = f"Alerte Vulnérabilité ({ecosystem}) : {name} v{version} est vulnérable ({vuln_list})"
+
+            cursor.execute('''
+                INSERT INTO alerts (timestamp, hostname, process_name, pid, port, alert_message, is_anomaly, remediation_action)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ''', (
+                datetime.datetime.now(), inventory.hostname, "Vulnerability-Scanner", "0", 0, msg, True, "Mettre à jour via apt/pip/npm"
+            ))
+
+            log_dict = {
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "hostname": inventory.hostname,
+                "alert_message": msg,
+                "is_anomaly": True,
+                "remediation_action": "Mettre à jour le composant système",
+                "soc_source": "osquery_vulnerability_scanner"
+            }
+            logger.info(json.dumps(log_dict))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return {"status": "success", "vulnerabilities": total_vulns}
 
 @app.get("/api/alerts/")
 def get_alerts(limit: int = 100):

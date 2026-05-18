@@ -135,8 +135,57 @@ def check_network_traffic():
         total_bytes = row.get('total_bytes', 0)
         msg = f"Trafic réseau élevé : {total_bytes} octets envoyés par {name} (PID {pid})"
         print(f"[!] TRAFIC ANORMAL : {msg}")
-        send_log(name, pid, 0, msg, bytes_sent=total_bytes)   
-             
+        send_log(name, pid, 0, msg, bytes_sent=total_bytes)  
+         
+def check_software_inventory():
+    """Vérification des dépendances """
+    all_packages = []
+
+    os_info = execute_osquery("SELECT platform_like, name FROM os_version;")
+    platform_like = os_info[0].get("platform_like", "").lower() if os_info else ""
+    
+    # Collecte des paquets Système selon l'OS détecté
+    if "debian" in platform_like or "ubuntu" in platform_like:
+        os_data = execute_osquery("SELECT name, version FROM deb_packages;")
+        ecosystem = "Debian"
+    elif "rhel" in platform_like or "centos" in platform_like or "fedora" in platform_like:
+        os_data = execute_osquery("SELECT name, version FROM rpm_packages;")
+        ecosystem = "RedHat" 
+    else:
+        os_data = []
+        ecosystem = "Unknown"
+
+    for row in os_data:
+        all_packages.append({"name": row["name"], "version": row["version"], "ecosystem": ecosystem})
+
+    # Paquets Python 
+    py_data = execute_osquery("SELECT name, version FROM python_packages;")
+    for row in py_data:
+        all_packages.append({"name": row["name"], "version": row["version"], "ecosystem": "PyPI"})
+    # Paquets Node.js
+    npm_data = execute_osquery("SELECT name, version FROM npm_packages;")
+    for row in npm_data:
+        all_packages.append({"name": row["name"], "version": row["version"], "ecosystem": "npm"})
+    if not all_packages:
+        return
+
+    payload = {
+        "hostname": HOSTNAME,
+        "packages": all_packages
+    }
+
+    try:
+        r = requests.post(f"{API_URL}/inventory/", json=payload, timeout=15)
+        if r.status_code == 200:
+            resp = r.json()
+            vulns = resp.get("vulnerabilities", 0)
+            if vulns > 0:
+                print(f"[!] INVENTAIRE GLOBAL : {vulns} vulnérabilité(s) trouvée(s) sur le serveur !")
+            else:
+                print(f"  [+] Inventaire système ({ecosystem}) vérifié (0 vulnérabilité).")
+    except Exception as e:
+        print(f"  [!] Backend inaccessible pour l'inventaire : {e}")  
+                        
 def fetch_and_execute_actions():
     """Interroge le backend pour voir si l'admin a cliqué sur le bouton Kill."""
     try:
@@ -161,12 +210,18 @@ def execute_kill(pid):
         print(f"  [-] Échec lors de la destruction du PID {pid}: {e}")
 def agent_loop(interval_seconds=30):
     print(f"[*] Agent SOC démarré — cycle toutes les {interval_seconds}s.")
+    cycle_count = 0
     while True:
+        cycle_count += 1
         print(f"\n[*] --- Cycle {time.strftime('%H:%M:%S')} ---")
         check_ports()
         check_suspicious_processes()
         check_shell_history_for_sql()
         check_network_traffic()
+        # L'inventaire logiciel change peu, on le lance 1 fois sur 10 cycles
+        if cycle_count % 10 == 1:
+            print("[*] Lancement de l'analyse d'inventaire logiciel (Supply Chain)...")
+            check_software_inventory()
         print(f"[*] Prochain cycle dans {interval_seconds}s...")
         #fetch_and_execute_actions()
         time.sleep(interval_seconds)
