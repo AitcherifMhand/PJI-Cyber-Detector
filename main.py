@@ -10,6 +10,9 @@ import json
 import requests
 #from ml_module import CyberAnomalyDetector
 from typing import Optional
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 app = FastAPI(title="SOC Cyber-Detector API", description="API avec PostgreSQL")
 
 app.add_middleware(
@@ -195,7 +198,9 @@ def receive_inventory(inventory: InventoryEntry):
             
             vuln_list = ", ".join(vulns[:3]) 
             msg = f"Alerte Vulnérabilité ({ecosystem}) : {name} v{version} est vulnérable ({vuln_list})"
-
+            cursor.execute("SELECT id FROM alerts WHERE hostname=%s AND alert_message=%s", (inventory.hostname, msg))
+            if cursor.fetchone():
+                continue
             cursor.execute('''
                 INSERT INTO alerts (timestamp, hostname, process_name, pid, port, alert_message, is_anomaly, remediation_action)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
