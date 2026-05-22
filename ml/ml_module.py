@@ -8,6 +8,259 @@ from collections import defaultdict
 import datetime
 import warnings
 warnings.filterwarnings('ignore')
+ 
+# CONSTANTES 
+RISK_THRESHOLDS = {
+    "CRITICAL": 80,
+    "HIGH":     60,
+    "WARNING":  30,
+    "INFO":     0,
+}
+ 
+# Ports connus comme dangereux (C2, reverse shells)
+MALICIOUS_PORTS = {4444, 1337, 31337, 9001, 6666, 12345}
+# Ports à surveiller mais légitimes
+SENSITIVE_PORTS = {22, 3306, 5432, 6379, 27017, 8080, 8443}
+ 
+MALICIOUS_PROCESSES = {"nc", "ncat", "netcat", "msfconsole", "meterpreter", "empire", "cobalt"}
+EXFIL_TOOLS        = {"curl", "wget", "scp", "rsync", "ftp", "tar", "zip", "7z", "rar"}
+SUSPICIOUS_LANGS   = {"python3", "ruby", "perl", "bash", "sh", "powershell"}
+ 
+SQL_DANGER = {"DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT"}
+SQL_EXFIL  = {"SELECT", "UNION", "INSERT", "EXPORT", "OUTFILE"}
+ 
+# Seuils de volume
+EXFIL_BYTES_CRITICAL = 100_000   # 100 KB → suspect
+EXFIL_BYTES_HIGH     = 50_000    # 50 KB → à surveiller
+BURST_REQUESTS_WARN  = 60        # >60 req/min → anormal
+BURST_REQUESTS_CRIT  = 200       # >200 req/min → attaque probable
+PORT_ENTROPY_HIGH    = 10        # >10 ports distincts contactés → scan
+ 
+ 
+# FENÊTRES TEMPORELLES — État comportemental par hôte
+ 
+class HostBehaviorWindow:
+    """
+    Maintient l'état comportemental glissant par hôte.
+    Windows : 1 min, 5 min, 1 heure.
+    Tout en mémoire, pas de DB.
+    """
+ 
+    def __init__(self):
+        # ring buffer de timestamps pour calculer les taux
+        self._events_1m  = deque()   # timestamps sur 1 min
+        self._events_5m  = deque()   # timestamps sur 5 min
+        self._events_1h  = deque()   # timestamps sur 1 heure
+ 
+        # Compteurs de volume glissants
+        self._bytes_1m   = deque()   # (ts, bytes)
+        self._bytes_5m   = deque()   # (ts, bytes)
+ 
+        # Ports et IPs uniques (toujours croissants — reset toutes les heures)
+        self._ports_1h   = set()
+        self._ips_1h     = set()
+        self._last_hour_reset = datetime.datetime.now()
+ 
+        # Compteurs de comportements suspects cumulés (reset à l'heure)
+        self.sudo_count         = 0
+        self.failed_login_count = 0
+        self.archive_count      = 0
+        self.sql_danger_count   = 0
+ 
+        self.last_seen = datetime.datetime.now()
+ 
+    def _flush_old(self, now: datetime.datetime):
+        """Retire les événements hors de leur fenêtre."""
+        cutoff_1m = now - datetime.timedelta(minutes=1)
+        cutoff_5m = now - datetime.timedelta(minutes=5)
+        cutoff_1h = now - datetime.timedelta(hours=1)
+ 
+        while self._events_1m  and self._events_1m[0]  < cutoff_1m:  self._events_1m.popleft()
+        while self._events_5m  and self._events_5m[0]  < cutoff_5m:  self._events_5m.popleft()
+        while self._events_1h  and self._events_1h[0]  < cutoff_1h:  self._events_1h.popleft()
+        while self._bytes_1m   and self._bytes_1m[0][0] < cutoff_1m: self._bytes_1m.popleft()
+        while self._bytes_5m   and self._bytes_5m[0][0] < cutoff_5m: self._bytes_5m.popleft()
+ 
+        # Reset ports/IPs/compteurs chaque heure
+        if (now - self._last_hour_reset).total_seconds() > 3600:
+            self._ports_1h.clear()
+            self._ips_1h.clear()
+            self.sudo_count         = 0
+            self.failed_login_count = 0
+            self.archive_count      = 0
+            self.sql_danger_count   = 0
+            self._last_hour_reset   = now
+ 
+    def update(self, log: dict) -> dict:
+        """Met à jour les fenêtres et retourne les features calculées."""
+        now = _parse_ts(log.get("timestamp"))
+        self._flush_old(now)
+ 
+        bytes_sent = int(log.get("bytes_sent", 0) or 0)
+        port       = int(log.get("port", 0) or 0)
+        remote_ip  = str(log.get("remote_ip", "") or "")
+        process    = str(log.get("process_name", "") or "").lower()
+        msg        = str(log.get("alert_message", "") or "").upper()
+ 
+        self._events_1m.append(now)
+        self._events_5m.append(now)
+        self._events_1h.append(now)
+        self._bytes_1m.append((now, bytes_sent))
+        self._bytes_5m.append((now, bytes_sent))
+ 
+        if port:       self._ports_1h.add(port)
+        if remote_ip:  self._ips_1h.add(remote_ip)
+ 
+        # Compteurs comportementaux
+        if "SUDO" in msg or process == "sudo":
+            self.sudo_count += 1
+        if "FAILED" in msg and "LOGIN" in msg:
+            self.failed_login_count += 1
+        if any(t in process for t in ("tar", "zip", "7z", "rar", "gzip")):
+            self.archive_count += 1
+        if any(k in msg for k in SQL_DANGER):
+            self.sql_danger_count += 1
+ 
+        self.last_seen = now
+ 
+        # Calcul des features
+        req_per_min   = len(self._events_1m)
+        req_per_5m    = len(self._events_5m)
+        req_per_hour  = len(self._events_1h)
+        bytes_1m      = sum(b for _, b in self._bytes_1m)
+        bytes_5m      = sum(b for _, b in self._bytes_5m)
+        unique_ports  = len(self._ports_1h)
+        unique_ips    = len(self._ips_1h)
+ 
+        # Entropie de ports (mesure de dispersion)
+        port_entropy = _entropy(list(self._ports_1h)) if self._ports_1h else 0.0
+ 
+        return {
+            "req_per_min":           req_per_min,
+            "req_per_5m":            req_per_5m,
+            "req_per_hour":          req_per_hour,
+            "bytes_sent_1m":         bytes_1m,
+            "bytes_sent_5m":         bytes_5m,
+            "unique_ports_1h":       unique_ports,
+            "unique_ips_1h":         unique_ips,
+            "port_entropy":          port_entropy,
+            "sudo_count_1h":         self.sudo_count,
+            "failed_login_count_1h": self.failed_login_count,
+            "archive_count_1h":      self.archive_count,
+            "sql_danger_count_1h":   self.sql_danger_count,
+        }
+ 
+ 
+ 
+FEATURE_COLUMNS = [
+    # Volume
+    "bytes_sent_log",
+    "bytes_recv_log",
+    "upload_ratio",
+    # Temps
+    "hour",
+    "is_night",
+    "is_weekend",
+    # Réseau
+    "is_malicious_port",
+    "is_sensitive_port",
+    "unique_ports_1h",
+    "unique_ips_1h",
+    "port_entropy",
+    # Comportement processus
+    "is_malicious_process",
+    "is_exfil_tool",
+    "is_suspicious_lang",
+    "archive_count_1h",
+    # Requêtes
+    "req_per_min",
+    "req_per_5m",
+    "req_per_hour",
+    "bytes_sent_1m",
+    "bytes_sent_5m",
+    # Activité utilisateur
+    "sudo_count_1h",
+    "failed_login_count_1h",
+    # SQL
+    "sql_danger_count_1h",
+    "has_sql_exfil",
+    "has_sql_danger",
+]
+ 
+ 
+def extract_features(log: dict, window_features: dict | None = None) -> dict:
+    """
+    Transforme un log brut en vecteur de features numériques.
+    window_features : dict retourné par HostBehaviorWindow.update()
+    Si window_features=None (training batch), on utilise les valeurs du log directement.
+    """
+    now    = _parse_ts(log.get("timestamp"))
+    bytes_sent = float(log.get("bytes_sent", 0) or 0)
+    bytes_recv = float(log.get("bytes_received", 0) or 0)
+    port   = int(log.get("port", 0) or 0)
+    proc   = str(log.get("process_name", "") or "").lower().strip()
+    msg    = str(log.get("alert_message", "") or "").upper()
+ 
+    total_bytes = bytes_sent + bytes_recv + 1e-9
+    upload_ratio = bytes_sent / total_bytes
+ 
+    msg_words = set(msg.split())
+    has_sql_exfil  = int(bool(msg_words & SQL_EXFIL))
+    has_sql_danger = int(bool(msg_words & SQL_DANGER))
+ 
+    wf = window_features or {}
+ 
+    features = {
+        # Volume
+        "bytes_sent_log":    math.log1p(bytes_sent),
+        "bytes_recv_log":    math.log1p(bytes_recv),
+        "upload_ratio":      upload_ratio,
+        # Temps
+        "hour":              now.hour,
+        "is_night":          int(now.hour >= 22 or now.hour <= 5),
+        "is_weekend":        int(now.weekday() >= 5),
+        # Réseau
+        "is_malicious_port": int(port in MALICIOUS_PORTS),
+        "is_sensitive_port": int(port in SENSITIVE_PORTS),
+        "unique_ports_1h":   wf.get("unique_ports_1h", 0),
+        "unique_ips_1h":     wf.get("unique_ips_1h", 0),
+        "port_entropy":      wf.get("port_entropy", 0.0),
+        # Processus
+        "is_malicious_process": int(proc in MALICIOUS_PROCESSES),
+        "is_exfil_tool":        int(proc in EXFIL_TOOLS),
+        "is_suspicious_lang":   int(proc in SUSPICIOUS_LANGS),
+        "archive_count_1h":     wf.get("archive_count_1h", 0),
+        # Taux de requêtes
+        "req_per_min":   wf.get("req_per_min", 1),
+        "req_per_5m":    wf.get("req_per_5m", 1),
+        "req_per_hour":  wf.get("req_per_hour", 1),
+        "bytes_sent_1m": math.log1p(wf.get("bytes_sent_1m", bytes_sent)),
+        "bytes_sent_5m": math.log1p(wf.get("bytes_sent_5m", bytes_sent)),
+        # Utilisateur
+        "sudo_count_1h":         wf.get("sudo_count_1h", 0),
+        "failed_login_count_1h": wf.get("failed_login_count_1h", 0),
+        # SQL
+        "sql_danger_count_1h": wf.get("sql_danger_count_1h", 0),
+        "has_sql_exfil":       has_sql_exfil,
+        "has_sql_danger":      has_sql_danger,
+    }
+ 
+    return features
+ 
+ 
+def extract_features_batch(logs_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extraction batch pour l'entraînement.
+    Pas de fenêtres temporelles (on les simule depuis les données).
+    """
+    rows = []
+    for _, row in logs_df.iterrows():
+        f = extract_features(row.to_dict(), window_features=None)
+        rows.append(f)
+    df = pd.DataFrame(rows, columns=FEATURE_COLUMNS)
+    return df.fillna(0)
+ 
+ 
 
 class CyberAnomalyDetector:
     """Détecteur d'anomalies cyber basé sur ML"""
