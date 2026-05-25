@@ -1,10 +1,12 @@
+import math
+
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 import joblib
 import os
-from collections import defaultdict
+from collections import defaultdict, deque
 import datetime
 import warnings
 warnings.filterwarnings('ignore')
@@ -260,7 +262,182 @@ def extract_features_batch(logs_df: pd.DataFrame) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=FEATURE_COLUMNS)
     return df.fillna(0)
  
- 
+ # RULES ENGINE 
+
+class RulesEngine:
+    """
+    Moteur de règles expertes cybersécurité.
+    Retourne : (score 0–100, raisons[], remédiation, axes de risque)
+    """
+
+    def evaluate(self, log: dict, wf: dict) -> tuple[float, list[str], str, dict]:
+        score   = 0.0
+        reasons = []
+
+        # Axes de risque indépendants (pour scoring multi-axe)
+        axes = {
+            "exfiltration":  0.0,
+            "lateral":       0.0,
+            "privilege":     0.0,
+            "persistence":   0.0,
+            "recon":         0.0,
+        }
+
+        bytes_sent = int(log.get("bytes_sent", 0) or 0)
+        port       = int(log.get("port", 0) or 0)
+        proc       = str(log.get("process_name", "") or "").lower().strip()
+        msg        = str(log.get("alert_message", "") or "").upper()
+        msg_words  = set(msg.split())
+
+        #  Reverse shells / C2
+        if port in MALICIOUS_PORTS:
+            score += 55
+            axes["lateral"] += 55
+            reasons.append(f"Port C2/reverse shell connu ({port})")
+
+        if proc in MALICIOUS_PROCESSES:
+            score += 65
+            axes["lateral"] += 65
+            reasons.append(f"Processus malveillant ({proc})")
+
+        #  Exfiltration volume
+        if bytes_sent >= EXFIL_BYTES_CRITICAL:
+            score += 45
+            axes["exfiltration"] += 45
+            reasons.append(f"Volume critique exfiltré ({bytes_sent:,} octets)")
+        elif bytes_sent >= EXFIL_BYTES_HIGH:
+            score += 25
+            axes["exfiltration"] += 25
+            reasons.append(f"Volume élevé exfiltré ({bytes_sent:,} octets)")
+
+        #  Exfiltration taux (fenêtres temporelles)
+        bytes_5m = wf.get("bytes_sent_5m", 0)
+        if bytes_5m >= EXFIL_BYTES_CRITICAL * 3:
+            score += 35
+            axes["exfiltration"] += 35
+            reasons.append(f"Débit massif sur 5 min ({bytes_5m:,} octets)")
+
+        #  Burst de requêtes
+        rpm = wf.get("req_per_min", 0)
+        if rpm >= BURST_REQUESTS_CRIT:
+            score += 40
+            axes["recon"] += 40
+            reasons.append(f"Burst critique ({rpm} req/min) — probable automatisation")
+        elif rpm >= BURST_REQUESTS_WARN:
+            score += 20
+            axes["recon"] += 20
+            reasons.append(f"Taux de requêtes élevé ({rpm} req/min)")
+
+        #  Scan de ports (entropie + nb ports distincts)
+        unique_ports = wf.get("unique_ports_1h", 0)
+        if unique_ports >= PORT_ENTROPY_HIGH:
+            score += 30
+            axes["recon"] += 30
+            reasons.append(f"Scan de ports probable ({unique_ports} ports distincts/heure)")
+
+        #  Outils d'exfiltration (curl, wget, tar, zip…)
+        if proc in EXFIL_TOOLS or any(t in msg for t in [t.upper() for t in EXFIL_TOOLS]):
+            score += 30
+            axes["exfiltration"] += 30
+            reasons.append(f"Outil de transfert/compression détecté ({proc})")
+
+        #  SQL dangereux (DROP, DELETE, TRUNCATE)
+        if msg_words & SQL_DANGER:
+            score += 35
+            axes["exfiltration"] += 35
+            matched = msg_words & SQL_DANGER
+            reasons.append(f"Opération SQL destructrice ({', '.join(matched)})")
+
+        #  SQL exfiltration (SELECT massif, UNION, OUTFILE)
+        if msg_words & SQL_EXFIL:
+            score += 20
+            axes["exfiltration"] += 20
+            reasons.append("Requête SQL d'extraction détectée")
+
+        #  Accumulation SQL dangereuse (fenêtre 1h)
+        if wf.get("sql_danger_count_1h", 0) >= 3:
+            score += 20
+            axes["exfiltration"] += 20
+            reasons.append(f"Rafale SQL dangereuse ({wf['sql_danger_count_1h']} ops/heure)")
+
+        #  Escalade de privilèges
+        if wf.get("sudo_count_1h", 0) >= 5:
+            score += 25
+            axes["privilege"] += 25
+            reasons.append(f"Usage sudo intensif ({wf['sudo_count_1h']}x/heure)")
+
+        #  Bruteforce login
+        if wf.get("failed_login_count_1h", 0) >= 10:
+            score += 30
+            axes["lateral"] += 30
+            reasons.append(f"Bruteforce détecté ({wf['failed_login_count_1h']} échecs/heure)")
+
+        #  Activité nocturne (horaire inhabituel)
+        hour = _parse_ts(log.get("timestamp")).hour
+        if hour >= 22 or hour <= 5:
+            if score > 0:   # Amplificateur seulement si déjà suspect
+                score += 10
+                reasons.append("Activité nocturne (heure anormale)")
+
+        #  Archives suspectes (staging avant exfil)
+        if wf.get("archive_count_1h", 0) >= 3:
+            score += 20
+            axes["exfiltration"] += 20
+            reasons.append(f"Création massive d'archives ({wf['archive_count_1h']}x/heure) — staging probable")
+
+        # Normalisation
+        score = min(round(score, 2), 100)
+        for k in axes:
+            axes[k] = min(axes[k], 100)
+
+        remediation = self._remediation(score, axes, proc, port)
+        return score, reasons, remediation, axes
+
+    def _remediation(self, score: float, axes: dict, proc: str, port: int) -> str:
+        if score < RISK_THRESHOLDS["WARNING"]:
+            return "Aucune action requise."
+
+        actions = []
+        if axes["exfiltration"] >= 40:
+            actions.append("Bloquer IP source / destination")
+        if axes["lateral"] >= 40 or port in MALICIOUS_PORTS or proc in MALICIOUS_PROCESSES:
+            actions.append("Kill processus immédiat (Active Response Wazuh)")
+        if axes["exfiltration"] >= 35:
+            actions.append("Isoler l'hôte du réseau")
+        if axes["privilege"] >= 25:
+            actions.append("Désactiver le compte utilisateur")
+        if axes["recon"] >= 30:
+            actions.append("Rate-limiting + blacklist IP")
+        if not actions:
+            actions.append("Surveillance accrue (logging renforcé)")
+
+        return " | ".join(actions)
+
+def compute_risk_score(ml_score: float, rules_score: float, is_ml_anomaly: bool) -> float:
+    """
+    Score global pondéré :
+        40% ML comportemental  (non biaisé, détecte l'inconnu)
+        60% Règles expertes    (précision métier SOC)
+
+    Boost si le ML détecte une anomalie pure sans règle associée.
+    """
+    risk = (ml_score * 0.4) + (rules_score * 0.6)
+    if is_ml_anomaly and risk < RISK_THRESHOLDS["WARNING"]:
+        risk += 20   # Déviation comportementale sans signature connue
+    return min(round(risk, 2), 100)
+
+
+def classify_severity(risk_score: float) -> tuple[str, bool]:
+    if risk_score >= RISK_THRESHOLDS["CRITICAL"]:
+        return "CRITICAL", True
+    elif risk_score >= RISK_THRESHOLDS["HIGH"]:
+        return "HIGH", True
+    elif risk_score >= RISK_THRESHOLDS["WARNING"]:
+        return "WARNING", True
+    return "INFO", False
+
+
+# DÉTECTEUR PRINCIPAL
 
 class CyberAnomalyDetector:
     """Détecteur d'anomalies cyber basé sur ML"""
@@ -269,213 +446,151 @@ class CyberAnomalyDetector:
         self.contamination = contamination
         self.scaler = StandardScaler()
         self.isolation_forest = IsolationForest(
+            n_estimators=300,       
             contamination=contamination,
+            max_samples="auto",
+            max_features=1.0,
+            bootstrap=False,
             random_state=42,
-            n_estimators=200
+            n_jobs=-1,
         )
-        self.is_trained = False
-        # Suivi de l'état comportemental en mémoire (Time Windows)
-        self.host_state = defaultdict(lambda: {
-            'last_seen': datetime.datetime.now(),
-            'requests_last_minute': 0,
-            'bytes_sent_last_5m': 0,
-            'unique_ports_contacted': set(),
-            'suspicious_process_count': 0
-        })
-        
-    def extract_features(self, logs_df):
+        self.is_trained      = False
+        self.rules_engine    = RulesEngine()
+        self._host_windows: dict[str, HostBehaviorWindow] = defaultdict(HostBehaviorWindow)
+
+    def fit(self, logs_df: pd.DataFrame) -> "CyberAnomalyDetector":
         """
-        Extrait les features purement comportementales et de volume.
-        (Pas de NLP, pas d'analyse de texte brut ici)
+        Apprend le comportement normal sur un dataset historique.
+        logs_df : DataFrame avec colonnes Osquery standard.
         """
-        features = pd.DataFrame()
-        
-        # 1. Features Temporelles
-        if 'timestamp' in logs_df.columns:
-            logs_df['timestamp'] = pd.to_datetime(logs_df['timestamp'])
-            features['hour'] = logs_df['timestamp'].dt.hour
-            features['is_night'] = (features['hour'].between(22, 5)).astype(int)
-        else:
-            features['hour'] = datetime.datetime.now().hour
-            features['is_night'] = int(22 <= features['hour'].iloc[0] <= 23 or 0 <= features['hour'].iloc[0] <= 5)
+        print(f"[ML] Extraction des features comportementales ({len(logs_df)} événements)...")
+        X = extract_features_batch(logs_df)
 
-        # 2. Features de Volume et Réseau
-        features['bytes_sent'] = logs_df.get('bytes_sent', 0).fillna(0)
-        features['bytes_log'] = np.log1p(features['bytes_sent'])
-        features['is_unusual_port'] = (logs_df.get('port', 0).fillna(0) > 1024).astype(int)
-        
-        # 3. Features d'état (uniquement en prédiction temps réel)
-        if not is_training and len(logs_df) == 1:
-            state_feats = self._update_and_get_state_features(logs_df.iloc[0].to_dict())
-            features['req_per_min'] = state_feats['requests_per_minute']
-            features['bytes_5m'] = state_feats['bytes_sent_5m']
-            features['ports_entropy'] = state_feats['unique_ports_count']
-        else:
-            features['req_per_min'] = 1
-            features['bytes_5m'] = features['bytes_sent']
-            features['ports_entropy'] = 1
+        # Vérification colonnes
+        missing = set(FEATURE_COLUMNS) - set(X.columns)
+        for col in missing:
+            X[col] = 0
+        X = X[FEATURE_COLUMNS].astype(float)
 
-        return features
-    def _update_and_get_state_features(self, log_dict):
-        """Met à jour l'état de l'hôte et retourne les features temporelles"""
-        host = log_dict.get('hostname', 'unknown')
-        state = self.host_state[host]
-        now = pd.to_datetime(log_dict.get('timestamp', datetime.datetime.now()))
-        
-        time_diff = (now - state['last_seen']).total_seconds()
-        
-        # Réinitialisation des fenêtres glissantes si trop de temps s'est écoulé
-        if time_diff > 60:
-            state['requests_last_minute'] = 0
-        if time_diff > 300:
-            state['bytes_sent_last_5m'] = 0
-            
-        # Mise à jour
-        state['requests_last_minute'] += 1
-        state['bytes_sent_last_5m'] += log_dict.get('bytes_sent', 0)
-        state['unique_ports_contacted'].add(log_dict.get('port', 0))
-        state['last_seen'] = now
-        
-        return {
-            'requests_per_minute': state['requests_last_minute'],
-            'bytes_sent_5m': state['bytes_sent_last_5m'],
-            'unique_ports_count': len(state['unique_ports_contacted'])
-        }
-    
-    def evaluate_rules(self, log_dict):
-        """Moteur de règles cyber (Corrélation)"""
-        rules_score = 0
-        reasons = []
-        remediation = "Aucune action requise."
-        
-        msg = str(log_dict.get('alert_message', '')).upper()
-        process = str(log_dict.get('process_name', '')).lower()
-        port = log_dict.get('port', 0)
-        bytes_sent = log_dict.get('bytes_sent', 0)
+        print("[ML] Normalisation StandardScaler...")
+        X_scaled = self.scaler.fit_transform(X)
 
-        # Exfiltration / Volume
-        if bytes_sent > 50000:
-            rules_score += 40
-            reasons.append("Volume d'exfiltration massif")
-            remediation = "Bloquer IP et isoler l'hôte"
-            
-        if any(kw in msg for kw in ['CURL', 'WGET', 'TAR', 'ZIP']):
-            rules_score += 30
-            reasons.append("Outil de transfert/compression détecté")
-            
-        # Activité process/port suspecte (Reverse Shells, C2)
-        if port in [4444, 1337, 8080]:
-            rules_score += 50
-            reasons.append(f"Port sensible ({port}) utilisé")
-            remediation = "Kill Processus immédiat"
-            
-        if process in ['nc', 'ncat', 'netcat', 'msfconsole', 'meterpreter']:
-            rules_score += 60
-            reasons.append(f"Processus malveillant connu ({process})")
-            remediation = "Kill Processus immédiat"
+        print("[ML] Entraînement Isolation Forest...")
+        self.isolation_forest.fit(X_scaled)
 
-        # SQL Injection / Dump
-        if any(kw in msg for kw in ['SELECT', 'DROP', 'DELETE']):
-            rules_score += 30
-            reasons.append("Activité SQL suspecte")
-            if "DROP" in msg:
-                remediation = "Révoquer accès BDD"
+        self.is_trained = True
+        print(f"[ML] ✓ Modèle comportemental entraîné ({len(FEATURE_COLUMNS)} features, contamination={self.contamination})")
+        return self
 
-        return min(rules_score, 100), reasons, remediation
-    
-    def fit(self, logs_df):
-            """Apprend le comportement normal (uniquement IF)"""
-            print("[ML] Extraction des features comportementales...")
-            X = self.extract_features(logs_df, is_training=True)
-            
-            X_scaled = self.scaler.fit_transform(X)
-            
-            print(f"[ML] Apprentissage du comportement normal (Isolation Forest sur {X_scaled.shape[0]} événements)...")
-            self.isolation_forest.fit(X_scaled)
-            
-            self.is_trained = True
-            print("[ML] Modèle comportemental entraîné avec succès!")
-            return self
-    def predict(self, log_entry_dict):
-        """Analyse un événement, score le risque et propose une remédiation"""
-        log_df = pd.DataFrame([log_entry_dict])
-        
-        # 1. Extraction Features & Prédiction ML (Score de -1 à 1, on normalise de 0 à 100)
-        ml_score = 0
-        is_ml_anomaly = False
-        
+    # Prédiction temps réel 
+
+    def predict(self, log: dict) -> dict:
+        """
+        Analyse un événement en temps réel.
+        Retourne un dictionnaire de résultat complet.
+        """
+        hostname = str(log.get("hostname", "unknown"))
+
+        # 1. Mise à jour des fenêtres comportementales
+        wf = self._host_windows[hostname].update(log)
+
+        # 2. Extraction des features
+        feat = extract_features(log, window_features=wf)
+        X = pd.DataFrame([feat], columns=FEATURE_COLUMNS).fillna(0).astype(float)
+
+        # 3. Score ML (Isolation Forest)
+        ml_score       = 0.0
+        is_ml_anomaly  = False
+
         if self.is_trained:
-            X = self.extract_features(log_df, is_training=False)
-            # Assurer la consistance des colonnes
-            for col in self.scaler.feature_names_in_:
+            for col in FEATURE_COLUMNS:
                 if col not in X.columns:
                     X[col] = 0
-            X = X[self.scaler.feature_names_in_]
-            
+            X = X[FEATURE_COLUMNS]
             X_scaled = self.scaler.transform(X)
-            
-            # Plus la distance est négative, plus c'est anormal. On l'inverse pour le score.
-            raw_ml_score = self.isolation_forest.decision_function(X_scaled)[0]
-            prediction = self.isolation_forest.predict(X_scaled)[0]
-            
-            is_ml_anomaly = (prediction == -1)
-            # Conversion en "Indice de confiance d'anomalie" (0 à 100)
-            ml_score = np.clip((0.5 - raw_ml_score) * 100, 0, 100)
-        
-        # 2. Corrélation avec les Règles SOC
-        rules_score, reasons, recommended_remediation = self.evaluate_rules(log_entry_dict)
-        
-        # 3. Scoring de Risque Global
-        # Le ML compte pour 40%, les règles expertes pour 60%
-        risk_score = (ml_score * 0.4) + (rules_score * 0.6)
-        risk_score = min(round(risk_score, 2), 100)
-        
-        # Si le ML détecte une anomalie pure, on booste le score
-        if is_ml_anomaly and risk_score < 30:
-            risk_score += 20
-            reasons.append("Déviation comportementale (ML)")
 
-        # 4. Classification de Sévérité
-        severity = "INFO"
-        is_anomaly = False
-        
-        if risk_score >= 80:
-            severity = "CRITICAL"
-            is_anomaly = True
-        elif risk_score >= 60:
-            severity = "HIGH"
-            is_anomaly = True
-        elif risk_score >= 30:
-            severity = "WARNING"
-            is_anomaly = True
-            if recommended_remediation == "Aucune action requise.":
-                recommended_remediation = "Surveillance accrue"
+            raw_score      = self.isolation_forest.decision_function(X_scaled)[0]
+            prediction     = self.isolation_forest.predict(X_scaled)[0]
+            is_ml_anomaly  = (prediction == -1)
+
+            # Conversion : plus raw_score est négatif, plus c'est anormal
+            # On mappe [-0.5, 0.5] → [100, 0]
+            ml_score = float(np.clip((0.5 - raw_score) * 100, 0, 100))
+
+        # 4. Corrélation règles SOC
+        rules_score, reasons, remediation, risk_axes = self.rules_engine.evaluate(log, wf)
+
+        # 5. Score global
+        risk_score = compute_risk_score(ml_score, rules_score, is_ml_anomaly)
+
+        # Ajouter la raison ML si détection comportementale pure
+        if is_ml_anomaly and rules_score < RISK_THRESHOLDS["WARNING"]:
+            reasons.append("Déviation comportementale pure (Isolation Forest)")
+
+        # 6. Classification
+        severity, is_anomaly = classify_severity(risk_score)
+
+        # Remédiation minimale si WARNING sans règle
+        if is_anomaly and remediation == "Aucune action requise.":
+            remediation = "Surveillance accrue (logging renforcé)"
 
         return {
-            'is_anomaly': is_anomaly,
-            'severity': severity,
-            'risk_score': risk_score,
-            'ml_anomaly': bool(is_ml_anomaly),
-            'reasons': reasons,
-            'remediation': recommended_remediation
+            "is_anomaly":    is_anomaly,
+            "severity":      severity,
+            "risk_score":    risk_score,
+            "ml_score":      round(ml_score, 2),
+            "rules_score":   round(rules_score, 2),
+            "ml_anomaly":    is_ml_anomaly,
+            "reasons":       reasons,
+            "remediation":   remediation,
+            "risk_axes":     risk_axes,       # Décomposition multi-axe pour le dashboard
+            "window_state":  wf,              # État comportemental courant de l'hôte
         }
+
     
-    def save_model(self, path='ml_behavioral_model.joblib'):
-        model_data = {
-            'scaler': self.scaler,
-            'isolation_forest': self.isolation_forest,
-            'is_trained': self.is_trained,
-            'contamination': self.contamination
-        }
-        joblib.dump(model_data, path)
+    def save_model(self, path: str = "ml_behavioral_model.joblib") -> None:
+        joblib.dump({
+            "scaler":           self.scaler,
+            "isolation_forest": self.isolation_forest,
+            "is_trained":       self.is_trained,
+            "contamination":    self.contamination,
+        }, path)
+        print(f"[ML] Modèle sauvegardé → {path}")
 
     @classmethod
-    def load_model(cls, path='ml_behavioral_model.joblib'):
+    def load_model(cls, path: str = "ml_behavioral_model.joblib") -> "CyberAnomalyDetector":
         if not os.path.exists(path):
+            print(f"[ML] Aucun modèle trouvé à {path} — initialisation vierge.")
             return cls()
-        model_data = joblib.load(path)
-        detector = cls(contamination=model_data['contamination'])
-        detector.scaler = model_data['scaler']
-        detector.isolation_forest = model_data['isolation_forest']
-        detector.is_trained = model_data['is_trained']
+        data = joblib.load(path)
+        detector = cls(contamination=data["contamination"])
+        detector.scaler           = data["scaler"]
+        detector.isolation_forest = data["isolation_forest"]
+        detector.is_trained       = data["is_trained"]
+        print(f"[ML] Modèle chargé depuis {path} (trained={detector.is_trained})")
         return detector
+    
+    save_model  = save_model
+    load_model  = classmethod(lambda cls, path="ml_behavioral_model.joblib": cls.load(path))
+
+def _parse_ts(ts) -> datetime.datetime:
+    """Parse timestamp flexible (datetime, str ISO, None)."""
+    if isinstance(ts, datetime.datetime):
+        return ts
+    if isinstance(ts, str):
+        try:
+            return datetime.datetime.fromisoformat(ts)
+        except ValueError:
+            pass
+    return datetime.datetime.now()
+
+
+def _entropy(values: list) -> float:
+    """Entropie de Shannon sur une liste de valeurs discrètes."""
+    if not values:
+        return 0.0
+    counts = {}
+    for v in values:
+        counts[v] = counts.get(v, 0) + 1
+    n = len(values)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values() if c > 0)
