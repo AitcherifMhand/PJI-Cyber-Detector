@@ -38,122 +38,6 @@ BURST_REQUESTS_WARN  = 60        # >60 req/min → anormal
 BURST_REQUESTS_CRIT  = 200       # >200 req/min → attaque probable
 PORT_ENTROPY_HIGH    = 10        # >10 ports distincts contactés → scan
  
- 
-# FENÊTRES TEMPORELLES — État comportemental par hôte
- 
-class HostBehaviorWindow:
-    """
-    Maintient l'état comportemental glissant par hôte.
-    Windows : 1 min, 5 min, 1 heure.
-    Tout en mémoire, pas de DB.
-    """
- 
-    def __init__(self):
-        # ring buffer de timestamps pour calculer les taux
-        self._events_1m  = deque()   # timestamps sur 1 min
-        self._events_5m  = deque()   # timestamps sur 5 min
-        self._events_1h  = deque()   # timestamps sur 1 heure
- 
-        # Compteurs de volume glissants
-        self._bytes_1m   = deque()   # (ts, bytes)
-        self._bytes_5m   = deque()   # (ts, bytes)
- 
-        # Ports et IPs uniques (toujours croissants — reset toutes les heures)
-        self._ports_1h   = set()
-        self._ips_1h     = set()
-        self._last_hour_reset = datetime.datetime.now()
- 
-        # Compteurs de comportements suspects cumulés (reset à l'heure)
-        self.sudo_count         = 0
-        self.failed_login_count = 0
-        self.archive_count      = 0
-        self.sql_danger_count   = 0
- 
-        self.last_seen = datetime.datetime.now()
- 
-    def _flush_old(self, now: datetime.datetime):
-        """Retire les événements hors de leur fenêtre."""
-        cutoff_1m = now - datetime.timedelta(minutes=1)
-        cutoff_5m = now - datetime.timedelta(minutes=5)
-        cutoff_1h = now - datetime.timedelta(hours=1)
- 
-        while self._events_1m  and self._events_1m[0]  < cutoff_1m:  self._events_1m.popleft()
-        while self._events_5m  and self._events_5m[0]  < cutoff_5m:  self._events_5m.popleft()
-        while self._events_1h  and self._events_1h[0]  < cutoff_1h:  self._events_1h.popleft()
-        while self._bytes_1m   and self._bytes_1m[0][0] < cutoff_1m: self._bytes_1m.popleft()
-        while self._bytes_5m   and self._bytes_5m[0][0] < cutoff_5m: self._bytes_5m.popleft()
- 
-        # Reset ports/IPs/compteurs chaque heure
-        if (now - self._last_hour_reset).total_seconds() > 3600:
-            self._ports_1h.clear()
-            self._ips_1h.clear()
-            self.sudo_count         = 0
-            self.failed_login_count = 0
-            self.archive_count      = 0
-            self.sql_danger_count   = 0
-            self._last_hour_reset   = now
- 
-    def update(self, log: dict) -> dict:
-        """Met à jour les fenêtres et retourne les features calculées."""
-        now = _parse_ts(log.get("timestamp"))
-        self._flush_old(now)
- 
-        bytes_sent = int(log.get("bytes_sent", 0) or 0)
-        port       = int(log.get("port", 0) or 0)
-        remote_ip  = str(log.get("remote_ip", "") or "")
-        process    = str(log.get("process_name", "") or "").lower()
-        msg        = str(log.get("alert_message", "") or "").upper()
- 
-        self._events_1m.append(now)
-        self._events_5m.append(now)
-        self._events_1h.append(now)
-        self._bytes_1m.append((now, bytes_sent))
-        self._bytes_5m.append((now, bytes_sent))
- 
-        if port:       self._ports_1h.add(port)
-        if remote_ip:  self._ips_1h.add(remote_ip)
- 
-        # Compteurs comportementaux
-        if "SUDO" in msg or process == "sudo":
-            self.sudo_count += 1
-        if "FAILED" in msg and "LOGIN" in msg:
-            self.failed_login_count += 1
-        if any(t in process for t in ("tar", "zip", "7z", "rar", "gzip")):
-            self.archive_count += 1
-        if any(k in msg for k in SQL_DANGER):
-            self.sql_danger_count += 1
- 
-        self.last_seen = now
- 
-        # Calcul des features
-        req_per_min   = len(self._events_1m)
-        req_per_5m    = len(self._events_5m)
-        req_per_hour  = len(self._events_1h)
-        bytes_1m      = sum(b for _, b in self._bytes_1m)
-        bytes_5m      = sum(b for _, b in self._bytes_5m)
-        unique_ports  = len(self._ports_1h)
-        unique_ips    = len(self._ips_1h)
- 
-        # Entropie de ports (mesure de dispersion)
-        port_entropy = _entropy(list(self._ports_1h)) if self._ports_1h else 0.0
- 
-        return {
-            "req_per_min":           req_per_min,
-            "req_per_5m":            req_per_5m,
-            "req_per_hour":          req_per_hour,
-            "bytes_sent_1m":         bytes_1m,
-            "bytes_sent_5m":         bytes_5m,
-            "unique_ports_1h":       unique_ports,
-            "unique_ips_1h":         unique_ips,
-            "port_entropy":          port_entropy,
-            "sudo_count_1h":         self.sudo_count,
-            "failed_login_count_1h": self.failed_login_count,
-            "archive_count_1h":      self.archive_count,
-            "sql_danger_count_1h":   self.sql_danger_count,
-        }
- 
- 
- 
 FEATURE_COLUMNS = [
     # Volume
     "bytes_sent_log",
@@ -193,7 +77,7 @@ FEATURE_COLUMNS = [
 def extract_features(log: dict, window_features: dict | None = None) -> dict:
     """
     Transforme un log brut en vecteur de features numériques.
-    window_features : dict retourné par HostBehaviorWindow.update()
+    window_features : dict retourné par HostBehaviorWindow
     Si window_features=None (training batch), on utilise les valeurs du log directement.
     """
     now    = _parse_ts(log.get("timestamp"))
@@ -456,7 +340,6 @@ class CyberAnomalyDetector:
         )
         self.is_trained      = False
         self.rules_engine    = RulesEngine()
-        self._host_windows: dict[str, HostBehaviorWindow] = defaultdict(HostBehaviorWindow)
 
     def fit(self, logs_df: pd.DataFrame) -> "CyberAnomalyDetector":
         """
@@ -492,9 +375,12 @@ class CyberAnomalyDetector:
         hostname = str(log.get("hostname", "unknown"))
 
         # 1. Mise à jour des fenêtres comportementales
-        wf = self._host_windows[hostname].update(log)
+        wf = log.get("window_state", {})
+        if "port_entropy" not in wf:
+            unique_ports = wf.get("unique_ports_1h", 0)
+            wf["port_entropy"] = math.log2(unique_ports) if unique_ports > 0 else 0.0
 
-        # 2. Extraction des features
+        # 2. Extraction des features (on lui passe notre wf issu de PostgreSQL)
         feat = extract_features(log, window_features=wf)
         X = pd.DataFrame([feat], columns=FEATURE_COLUMNS).fillna(0).astype(float)
 

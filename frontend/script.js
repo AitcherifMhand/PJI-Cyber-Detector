@@ -51,11 +51,10 @@ function renderAlertsTable() {
   if (currentFilter === "anomalie")
     data = allAlerts.filter((a) => a.is_anomaly);
   else if (currentFilter === "port")
-    data = allAlerts.filter((a) => a.port === 4444 || a.port === 1337);
+    data = allAlerts.filter((a) => a.port === 4444 || a.port === 1337 || a.port === 22);
 
   if (!data.length) {
-    tbody.innerHTML =
-      '<div class="empty-state">Aucune alerte à afficher.</div>';
+    tbody.innerHTML = '<div class="empty-state">Aucune alerte à afficher.</div>';
     return;
   }
 
@@ -63,23 +62,44 @@ function renderAlertsTable() {
     .slice(0, 30)
     .map((a) => {
       const isResolved = a.resolved;
+      
+      const risk = a.risk_score !== undefined ? a.risk_score : 0;
+      const mlScore = a.ml_score !== undefined ? a.ml_score : 0;
+      const rulesScore = a.rules_score !== undefined ? a.rules_score : 0;
+      
+      const riskColor = risk >= 60 ? "var(--red)" : risk >= 30 ? "var(--amber)" : "var(--green)";
+
+      const mlDetails = a.reasons ? `<div style="font-size: 11px; color: var(--amber); margin-top: 6px; font-weight: 500;">🤖 IA : ${a.reasons}</div>` : "";
 
       return `
         <tr class="${isResolved ? "row-resolved" : ""}" id="row-${a.pid}">
-            <td>${new Date(a.timestamp).toLocaleString("fr-FR")}</td>
+            <td style="white-space: nowrap;">${new Date(a.timestamp).toLocaleString("fr-FR")}</td>
             <td><strong>${a.hostname}</strong></td>
-            <td>${a.process_name}</td>
-            <td>PID ${a.pid}</td>
+            <td>
+                ${a.process_name}
+                <div style="font-size:10px; color:var(--text-secondary); margin-top:2px;">PID: ${a.pid}</div>
+            </td>
             <td><span class="badge badge-port">:${a.port}</span></td>
-            <td class="alert-msg" style="max-width:200px; overflow:hidden; text-overflow:ellipsis;" title="${a.alert_message}">${a.alert_message}</td>
+            <td>
+                <div style="max-width:280px; word-wrap:break-word;" title="${a.alert_message}">
+                    ${a.alert_message}
+                </div>
+                ${mlDetails}
+            </td>
+            <td style="text-align: center;">
+                <div style="font-weight: 800; font-size: 14px; color: ${riskColor};">${risk}/100</div>
+                <div style="font-size: 9px; color: var(--text-secondary); margin-top:2px; text-transform: uppercase;">
+                    ML: ${mlScore} | RÈGLES: ${rulesScore}
+                </div>
+            </td>
             <td>
                 <span id="badge-${a.pid}" class="badge ${isResolved ? "badge-resolved" : a.is_anomaly ? "badge-anomaly" : "badge-normal"}">
                     ${isResolved ? "✓ Mitigé" : a.is_anomaly ? "Anomalie" : "Normal"}
                 </span>
             </td>
-            <td>${a.remediation_action || "—"}</td>
+            <td style="font-size: 12px;">${a.remediation_action || "—"}</td>
             <td>
-                ${a.is_anomaly ? `<button id="btn-${a.pid}" class="btn-primary ${isResolved ? "btn-disabled" : ""}" style="font-size:11px; padding:4px 8px;" onclick="killProcess('${a.pid}', '${a.hostname}')" ${isResolved ? "disabled" : ""}>${isResolved ? "Résolu" : "Kill"}</button>` : ""}
+                ${a.is_anomaly ? `<button id="btn-${a.pid}" class="btn-primary ${isResolved ? "btn-disabled" : ""}" style="font-size:11px; padding:6px 10px;" onclick="killProcess('${a.pid}', '${a.hostname}')" ${isResolved ? "disabled" : ""}>${isResolved ? "Résolu" : "Kill"}</button>` : ""}
             </td>
         </tr>
     `;
@@ -89,7 +109,15 @@ function renderAlertsTable() {
   tbody.innerHTML = `
         <table class="alert-table">
             <thead><tr>
-                <th>Horodatage</th><th>Hôte</th><th>Processus</th><th>PID</th><th>Port</th><th>Message</th><th>Statut</th><th>Remédiation</th><th>Action</th>
+                <th>Horodatage</th>
+                <th>Hôte</th>
+                <th>Processus</th>
+                <th>Port</th>
+                <th>Contexte & Détection</th>
+                <th style="text-align: center;">Score de Risque</th>
+                <th>Statut</th>
+                <th>Remédiation</th>
+                <th>Action</th>
             </tr></thead>
             <tbody>${rows}</tbody>
         </table>`;

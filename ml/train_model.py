@@ -1,37 +1,35 @@
 import pandas as pd
 import psycopg2
 import configparser
-from ml_module import CyberAnomalyDetector
+from ml_module import CyberAnomalyDetector, MALICIOUS_PORTS, MALICIOUS_PROCESSES
 
 print("[*] Connexion à la base de données PostgreSQL...")
 config = configparser.ConfigParser()
 config.read('db.config')
 
 try:
-    conn = psycopg2.connect(
-        dbname=config['postgresql']['dbname'],
-        user=config['postgresql']['user'],
-        password=config['postgresql']['password'],
-        host=config['postgresql']['host'],
-        port=config['postgresql']['port']
-    )
-    
-    query = "SELECT * FROM alerts"
+    conn = psycopg2.connect(**config['postgresql'])
+    query = "SELECT * FROM raw_logs"
     logs_df = pd.read_sql_query(query, conn)
     conn.close()
     
     if logs_df.empty:
-        print("[-] La base de données est vide. Générez d'abord du trafic avec osquery_agent.py.")
+        print("[-] Base de données vide. Le modèle ne peut pas s'entraîner sans historique de logs normaux.")
     else:
-        print(f"[+] {len(logs_df)} événements récupérés. Début de l'entraînement...")
+        print(f"[*] Total logs bruts : {len(logs_df)}")
         
-        # Initialisation et entraînement du modèle
-        detector = CyberAnomalyDetector(contamination=0.1)
-        detector.fit(logs_df)
+        clean_df = logs_df[
+            (~logs_df['port'].isin(MALICIOUS_PORTS)) & 
+            (~logs_df['process_name'].str.lower().isin(MALICIOUS_PROCESSES))
+        ]
         
-        # Sauvegarde du modèle
+        print(f"[*] Après filtrage des attaques connues : {len(clean_df)} logs normaux restants.")
+        
+        # Initialisation et entraînement
+        detector = CyberAnomalyDetector(contamination=0.05) 
+        detector.fit(clean_df)
+        
         detector.save_model('ml_behavioral_model.joblib')
-        print("[+] Fichier 'ml_behavioral_model.joblib' généré avec succès !")
 
 except Exception as e:
     print(f"[!] Erreur lors de l'entraînement : {e}")

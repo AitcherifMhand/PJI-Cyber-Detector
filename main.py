@@ -9,7 +9,7 @@ import logging
 import json
 import requests
 import os
-from ml_module import CyberAnomalyDetector
+from ml.ml_module import CyberAnomalyDetector
 from typing import Optional
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -83,6 +83,19 @@ def init_db():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS raw_logs (
+                id                SERIAL PRIMARY KEY,
+                timestamp         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                hostname          VARCHAR(255),
+                process_name      VARCHAR(255),
+                pid               INTEGER,
+                port              INTEGER,
+                bytes_sent        BIGINT DEFAULT 0,
+                remote_ip         VARCHAR(64),
+                alert_message     TEXT
+            )
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id                SERIAL PRIMARY KEY,
@@ -159,6 +172,30 @@ def get_wazuh_alerts(token: str, limit: int = 100) -> list:
         return resp.json()["data"]["affected_items"]
     return []
 
+def get_host_behavior_window(hostname: str) -> dict:
+    """Reconstruit le comportement de l'hôte sur les dernières 1h, 5m, 1m depuis PostgreSQL."""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # On récupère les agrégats glissants
+    cur.execute("""
+        SELECT 
+            COUNT(CASE WHEN timestamp >= NOW() - INTERVAL '1 minute' THEN 1 END) as req_per_min,
+            COUNT(CASE WHEN timestamp >= NOW() - INTERVAL '5 minutes' THEN 1 END) as req_per_5m,
+            COUNT(CASE WHEN timestamp >= NOW() - INTERVAL '1 hour' THEN 1 END) as req_per_hour,
+            COALESCE(SUM(CASE WHEN timestamp >= NOW() - INTERVAL '1 minute' THEN bytes_sent END), 0) as bytes_sent_1m,
+            COALESCE(SUM(CASE WHEN timestamp >= NOW() - INTERVAL '5 minutes' THEN bytes_sent END), 0) as bytes_sent_5m,
+            COUNT(DISTINCT CASE WHEN timestamp >= NOW() - INTERVAL '1 hour' THEN port END) as unique_ports_1h,
+            COUNT(DISTINCT CASE WHEN timestamp >= NOW() - INTERVAL '1 hour' THEN remote_ip END) as unique_ips_1h
+        FROM raw_logs 
+        WHERE hostname = %s AND timestamp >= NOW() - INTERVAL '1 hour'
+    """, (hostname,))
+    
+    window_data = cur.fetchone()
+    cur.close()
+    conn.close()
+    
+    return dict(window_data)
 @app.post("/api/logs/", status_code=201)
 def receive_log(log: LogEntry):
     """Point d'entrée principal de l'agent Osquery."""
@@ -168,60 +205,34 @@ def receive_log(log: LogEntry):
     if not log_dict.get("timestamp"):
         log_dict["timestamp"] = datetime.datetime.utcnow().isoformat()
 
-    #  SCORING ML + RÈGLES 
-    result      = detector.predict(log_dict)
-    is_anomaly  = result["is_anomaly"]
-    severity    = result["severity"]
-    risk_score  = result["risk_score"]
-    ml_score    = result["ml_score"]
-    rules_score = result["rules_score"]
-    remediation = result["remediation"]
-    reasons     = " | ".join(result["reasons"]) if result["reasons"] else ""
-    risk_axes   = json.dumps(result["risk_axes"])
+    # 1. Sauvegarde du log brut d'abord (pour la mémoire ML)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO raw_logs (timestamp, hostname, process_name, pid, port, bytes_sent, remote_ip, alert_message)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (log_dict["timestamp"], log.hostname, log.process_name, log.pid, log.port, log.bytes_sent or 0, log.remote_ip or "", log.alert_message))
+    conn.commit()
 
-    #  SAUVEGARDE BDD 
-    try:
-        conn = get_db_connection()
-        cur  = conn.cursor()
+    # 2. Reconstitution de la mémoire
+    wf = get_host_behavior_window(log.hostname)
+    log_dict['window_state'] = wf 
+
+    # 3. Évaluation hybride
+    result = detector.predict(log_dict) 
+    
+    # 4. Si c'est une alerte (score élevé ou anomalie), on insère dans la table alerts
+    if result["is_anomaly"] or result["rules_score"] > 0:
         cur.execute("""
-            INSERT INTO alerts
-                (timestamp, hostname, process_name, pid, port, alert_message,
-                 is_anomaly, severity, risk_score, ml_score, rules_score,
-                 remediation_action, reasons, risk_axes, bytes_sent, remote_ip)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            log_dict["timestamp"], log.hostname, log.process_name, log.pid,
-            log.port, log.alert_message, is_anomaly, severity, risk_score,
-            ml_score, rules_score, remediation, reasons, risk_axes,
-            log.bytes_sent or 0, log.remote_ip or "",
-        ))
+            INSERT INTO alerts (timestamp, hostname, process_name, pid, port, alert_message, is_anomaly, severity, risk_score, ml_score, rules_score, remediation_action, reasons, risk_axes)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (log_dict["timestamp"], log.hostname, log.process_name, log.pid, log.port, log.alert_message, result["is_anomaly"], result["severity"], result["risk_score"], result["ml_score"], result["rules_score"], result["remediation"], " | ".join(result["reasons"]), json.dumps(result["risk_axes"])))
         conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-    # Log JSON ==> Wazuh
-    log_dict.update({
-        "is_anomaly":        is_anomaly,
-        "severity":          severity,
-        "risk_score":        risk_score,
-        "ml_score":          ml_score,
-        "rules_score":       rules_score,
-        "remediation_action": remediation,
-        "reasons":           result["reasons"],
-        "soc_source":        "osquery_agent",
-    })
-    logger.info(json.dumps(log_dict))
-
-    return {
-        "status":      "success",
-        "is_anomaly":  is_anomaly,
-        "severity":    severity,
-        "risk_score":  risk_score,
-        "remediation": remediation,
-        "reasons":     result["reasons"],
-    }
+    cur.close()
+    conn.close()
+    
+    return {"status": "success", "is_anomaly": result["is_anomaly"]}
     
 def check_osv_vulnerabilities_batch(packages):
     """Interroge l'API Google OSV en utilisant l'endpoint /v1/querybatch avec découpage par lots."""
@@ -298,24 +309,26 @@ def get_alerts(limit: int = 100):
         if WAZUH_API_URL:
             token = get_wazuh_token()
             wazuh_alerts = get_wazuh_alerts(token, limit)
-            formatted = []
-            for a in wazuh_alerts:
-                d = a.get("data", {})
-                formatted.append({
-                    "id":               a.get("id"),
-                    "timestamp":        a.get("timestamp"),
-                    "hostname":         a.get("agent", {}).get("name", "Unknown"),
-                    "process_name":     d.get("process_name", "Unknown"),
-                    "pid":              d.get("pid", 0),
-                    "port":             d.get("port", 0),
-                    "alert_message":    a.get("rule", {}).get("description", ""),
-                    "is_anomaly":       d.get("is_anomaly", False),
-                    "severity":         d.get("severity", "INFO"),
-                    "risk_score":       d.get("risk_score", 0),
-                    "remediation_action": d.get("remediation_action", ""),
-                    "resolved":         False,
-                    "rule_level":       a.get("rule", {}).get("level", 0),
-                })
+            if wazuh_alerts:   
+                formatted = []
+                for a in wazuh_alerts:
+                    d = a.get("data", {})
+                    formatted.append({
+                        "id":               a.get("id"),
+                        "timestamp":        a.get("timestamp"),
+                        "hostname":         a.get("agent", {}).get("name", "Unknown"),
+                        "process_name":     d.get("process_name", "Unknown"),
+                        "pid":              d.get("pid", 0),
+                        "port":             d.get("port", 0),
+                        "alert_message":    a.get("rule", {}).get("description", ""),
+                        "is_anomaly":       d.get("is_anomaly", False),
+                        "severity":         d.get("severity", "INFO"),
+                        "risk_score":       d.get("risk_score", 0),
+                        "remediation_action": d.get("remediation_action", ""),
+                        "resolved":         False,
+                        "rule_level":       a.get("rule", {}).get("level", 0),
+                    })
+                return formatted
             return formatted
     except Exception as e:
         print(f"[WARN] Wazuh inaccessible : {e} — fallback DB")
