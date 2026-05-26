@@ -570,9 +570,6 @@ class CyberAnomalyDetector:
         print(f"[ML] Modèle chargé depuis {path} (trained={detector.is_trained})")
         return detector
     
-    save_model  = save_model
-    load_model  = classmethod(lambda cls, path="ml_behavioral_model.joblib": cls.load(path))
-
 def _parse_ts(ts) -> datetime.datetime:
     """Parse timestamp flexible (datetime, str ISO, None)."""
     if isinstance(ts, datetime.datetime):

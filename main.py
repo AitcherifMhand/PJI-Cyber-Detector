@@ -8,21 +8,26 @@ import configparser
 import logging
 import json
 import requests
-#from ml_module import CyberAnomalyDetector
+import os
+from ml_module import CyberAnomalyDetector
 from typing import Optional
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Chargement du modèle ML
+
+ML_MODEL_PATH = os.environ.get("ML_MODEL_PATH", "ml/ml_behavioral_model.joblib")
+detector = CyberAnomalyDetector.load_model(ML_MODEL_PATH)
 
 app = FastAPI(title="SOC Cyber-Detector API", description="API avec PostgreSQL")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # --- WAZUH CONFIGURATION ---
 wazuh_config = configparser.ConfigParser()
 wazuh_config.read('wazuh.config')
@@ -30,14 +35,18 @@ try:
     WAZUH_API_URL = wazuh_config['wazuh']['url']
     WAZUH_API_USER = wazuh_config['wazuh']['user']
     WAZUH_API_PASS = wazuh_config['wazuh']['password']
+    WAZUH_VERIFY_TLS = wazuh_config["wazuh"].getboolean("verify_tls", fallback=False)
+
 except KeyError as e:
     print(f"[ERREUR] Configuration Wazuh manquante dans wazuh.config: {e}")
-log_file_path = 'soc_alerts.json'
+    WAZUH_API_URL = WAZUH_API_USER = WAZUH_API_PASS = ""
+    WAZUH_VERIFY_TLS = False
+
+log_file_path = os.environ.get("SOC_LOG_PATH", "soc_alerts.json")
 logger = logging.getLogger("SOC_Logger")
 logger.setLevel(logging.INFO)
 handler = logging.FileHandler(log_file_path)
-formatter = logging.Formatter('%(message)s')
-handler.setFormatter(formatter)
+handler.setFormatter(logging.Formatter('%(message)s'))
 logger.addHandler(handler)
 # --- CONFIGURATION POSTGRESQL ---
 config = configparser.ConfigParser()
@@ -60,8 +69,11 @@ class LogEntry(BaseModel):
     pid: int
     port: int
     alert_message: str
-    bytes_sent: Optional[int] = 0
-    query_text: Optional[str] = ""
+    bytes_sent:    Optional[int] = 0
+    bytes_received: Optional[int] = 0
+    query_text:    Optional[str] = ""
+    remote_ip:     Optional[str] = ""
+    timestamp:     Optional[str] = None
     
 def get_db_connection():
     """Crée et retourne une connexion à PostgreSQL."""
@@ -70,22 +82,41 @@ def init_db():
     """Initialise la table dans PostgreSQL si elle n'existe pas."""
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
+        cur = conn.cursor()
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
-                id SERIAL PRIMARY KEY,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                hostname VARCHAR(255),
-                process_name VARCHAR(255),
-                pid INTEGER,
-                port INTEGER,
-                alert_message TEXT,
-                is_anomaly BOOLEAN,
-                remediation_action TEXT
+                id                SERIAL PRIMARY KEY,
+                timestamp         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                hostname          VARCHAR(255),
+                process_name      VARCHAR(255),
+                pid               INTEGER,
+                port              INTEGER,
+                alert_message     TEXT,
+                is_anomaly        BOOLEAN DEFAULT FALSE,
+                resolved          BOOLEAN DEFAULT FALSE,
+                severity          VARCHAR(16),
+                risk_score        FLOAT,
+                ml_score          FLOAT,
+                rules_score       FLOAT,
+                remediation_action TEXT,
+                reasons           TEXT,
+                risk_axes         TEXT,
+                bytes_sent        BIGINT DEFAULT 0,
+                remote_ip         VARCHAR(64)
             )
-        ''')
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                id          SERIAL PRIMARY KEY,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                hostname    VARCHAR(255),
+                action      VARCHAR(64),
+                pid         INTEGER,
+                done        BOOLEAN DEFAULT FALSE
+            )
+        """)
         conn.commit()
-        cursor.close()
+        cur.close()
         conn.close()
         print("[OK] Base de données PostgreSQL initialisée.")
     except Exception as e:
@@ -93,251 +124,313 @@ def init_db():
 
 init_db()
 
-pending_actions = []
+# Helper functions pour Wazuh API
+def get_wazuh_token() -> str:
+    if not WAZUH_API_URL:
+        raise RuntimeError("Wazuh non configuré")
+    resp = requests.post(
+        f"{WAZUH_API_URL}/security/user/authenticate",
+        auth=(WAZUH_API_USER, WAZUH_API_PASS),
+        verify=WAZUH_VERIFY_TLS,
+        timeout=8,
+    )
+    if resp.status_code == 200:
+        return resp.json()["data"]["token"]
+    raise RuntimeError(f"Auth Wazuh échouée ({resp.status_code})")
+
+def get_agent_id(hostname: str, token: str) -> Optional[str]:
+    resp = requests.get(
+        f"{WAZUH_API_URL}/agents?q=name={hostname}",
+        headers={"Authorization": f"Bearer {token}"},
+        verify=WAZUH_VERIFY_TLS,
+        timeout=8,
+    )
+    items = resp.json().get("data", {}).get("affected_items", [])
+    return items[0]["id"] if items else None
+
+def get_wazuh_alerts(token: str, limit: int = 100) -> list:
+    resp = requests.get(
+        f"{WAZUH_API_URL}/alerts/history?limit={limit}",
+        headers={"Authorization": f"Bearer {token}"},
+        verify=WAZUH_VERIFY_TLS,
+        timeout=10,
+    )
+    if resp.status_code == 200:
+        return resp.json()["data"]["affected_items"]
+    return []
 
 @app.post("/api/logs/", status_code=201)
 def receive_log(log: LogEntry):
-    # Règles de gestion (Simulant la détection en attendant l'intégration ML complète)
-    is_anomaly = False
-    remediation = ""
-    
-    # Règle 1: Détection de port suspect ou d'outil de reverse shell
-    if log.port in [4444, 1337] or log.process_name.lower() in ["nc", "ncat", "netcat", "msfconsole"]:
-        is_anomaly = True
-        remediation = "Kill Process"
-                
-    # Règle 2: Détection de commandes shell suspectes (SQL / Exfiltration)
-    msg_upper = log.alert_message.upper()
-    if "SELECT" in msg_upper or "DROP" in msg_upper or "DELETE" in msg_upper:
-        is_anomaly = True
-        remediation = "Vérifier Injection / Isoler Machine"
-    elif "CURL" in msg_upper or "WGET" in msg_upper:
-        is_anomaly = True
-        remediation = "Vérifier Exfiltration / Bloquer IP"
-        
-    # Règle 3: Exfiltration réseau massive
-    if log.bytes_sent > 50000:
-        is_anomaly = True
-        remediation = "Bloquer IP"
+    """Point d'entrée principal de l'agent Osquery."""
 
+    # Horodatage de réception si absent
+    log_dict = log.dict()
+    if not log_dict.get("timestamp"):
+        log_dict["timestamp"] = datetime.datetime.utcnow().isoformat()
+
+    #  SCORING ML + RÈGLES 
+    result      = detector.predict(log_dict)
+    is_anomaly  = result["is_anomaly"]
+    severity    = result["severity"]
+    risk_score  = result["risk_score"]
+    ml_score    = result["ml_score"]
+    rules_score = result["rules_score"]
+    remediation = result["remediation"]
+    reasons     = " | ".join(result["reasons"]) if result["reasons"] else ""
+    risk_axes   = json.dumps(result["risk_axes"])
+
+    #  SAUVEGARDE BDD 
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO alerts (timestamp, hostname, process_name, pid, port, alert_message, is_anomaly, remediation_action)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ''', (
-            datetime.datetime.now(), log.hostname, log.process_name, log.pid, log.port, log.alert_message, is_anomaly, remediation
+        cur  = conn.cursor()
+        cur.execute("""
+            INSERT INTO alerts
+                (timestamp, hostname, process_name, pid, port, alert_message,
+                 is_anomaly, severity, risk_score, ml_score, rules_score,
+                 remediation_action, reasons, risk_axes, bytes_sent, remote_ip)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            log_dict["timestamp"], log.hostname, log.process_name, log.pid,
+            log.port, log.alert_message, is_anomaly, severity, risk_score,
+            ml_score, rules_score, remediation, reasons, risk_axes,
+            log.bytes_sent or 0, log.remote_ip or "",
         ))
         conn.commit()
-        cursor.close()
+        cur.close()
         conn.close()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PostgreSQL Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-    # Enregistrement dans le fichier JSON (Pour ingestion par Wazuh)
-    log_dict = log.dict()
-    log_dict["timestamp"] = datetime.datetime.utcnow().isoformat()
-    log_dict["is_anomaly"] = is_anomaly
-    log_dict["remediation_action"] = remediation
-    log_dict["soc_source"] = "osquery_agent"
-    
+    # Log JSON ==> Wazuh
+    log_dict.update({
+        "is_anomaly":        is_anomaly,
+        "severity":          severity,
+        "risk_score":        risk_score,
+        "ml_score":          ml_score,
+        "rules_score":       rules_score,
+        "remediation_action": remediation,
+        "reasons":           result["reasons"],
+        "soc_source":        "osquery_agent",
+    })
     logger.info(json.dumps(log_dict))
 
-    return {"status": "success", "is_anomaly": is_anomaly, "remediation": remediation}
-
+    return {
+        "status":      "success",
+        "is_anomaly":  is_anomaly,
+        "severity":    severity,
+        "risk_score":  risk_score,
+        "remediation": remediation,
+        "reasons":     result["reasons"],
+    }
+    
 def check_osv_vulnerabilities_batch(packages):
     """Interroge l'API Google OSV en utilisant l'endpoint /v1/querybatch avec découpage par lots."""
-    url = "https://api.osv.dev/v1/querybatch"
-    queries = []
-    for pkg in packages:
-        if pkg.get("name") and pkg.get("version"):
-            queries.append({
-                "version": pkg.get("version"),
-                "package": {
-                    "name": pkg.get("name"),
-                    "ecosystem": pkg.get("ecosystem", "PyPI")
-                }
-            })
-            
+    queries = [
+        {"version": p["version"], "package": {"name": p["name"], "ecosystem": p.get("ecosystem", "PyPI")}}
+        for p in packages if p.get("name") and p.get("version")
+    ]
     all_results = []
-    chunk_size = 100
-    
-    for i in range(0, len(queries), chunk_size):
-        chunk = {"queries": queries[i:i + chunk_size]}
+    for i in range(0, len(queries), 100):
+        chunk = {"queries": queries[i:i + 100]}
         try:
-            resp = requests.post(url, json=chunk, timeout=10)
+            resp = requests.post("https://api.osv.dev/v1/querybatch", json=chunk, timeout=15)
             if resp.status_code == 200:
-                data = resp.json()
-                all_results.extend(data.get("results", []))
+                all_results.extend(resp.json().get("results", []))
             else:
-                logger.error(f"[ERREUR] API OSV HTTP {resp.status_code}")
-                all_results.extend([{} for _ in range(len(chunk["queries"]))])
-        except Exception as e:
-            logger.error(f"[ERREUR] Exception OSV API: {e}")
-            all_results.extend([{} for _ in range(len(chunk["queries"]))])
-            
+                all_results.extend([{}] * len(chunk["queries"]))
+        except Exception:
+            all_results.extend([{}] * len(chunk["queries"]))
     return queries, all_results
 
 @app.post("/api/inventory/", status_code=200)
 def receive_inventory(inventory: InventoryEntry):
     total_vulns = 0
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
     queries, results = check_osv_vulnerabilities_batch(inventory.packages)
-
-    for i, result in enumerate(results):
-        if "vulns" in result:
-            vulns = [v.get("id") for v in result["vulns"]]
-            total_vulns += len(vulns)
-            
-            name = queries[i]["package"]["name"]
-            version = queries[i]["version"]
-            ecosystem = queries[i]["package"]["ecosystem"]
-            
-            vuln_list = ", ".join(vulns[:3]) 
-            msg = f"Alerte Vulnérabilité ({ecosystem}) : {name} v{version} est vulnérable ({vuln_list})"
-            cursor.execute("SELECT id FROM alerts WHERE hostname=%s AND alert_message=%s", (inventory.hostname, msg))
-            if cursor.fetchone():
+    try:
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        for i, result in enumerate(results):
+            if "vulns" not in result:
                 continue
-            cursor.execute('''
-                INSERT INTO alerts (timestamp, hostname, process_name, pid, port, alert_message, is_anomaly, remediation_action)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ''', (
-                datetime.datetime.now(), inventory.hostname, "Vulnerability-Scanner", "0", 0, msg, True, "Mettre à jour via apt/pip/npm"
-            ))
+            vulns   = [v.get("id") for v in result["vulns"]]
+            total_vulns += len(vulns)
+            name    = queries[i]["package"]["name"]
+            version = queries[i]["version"]
+            eco     = queries[i]["package"]["ecosystem"]
+            ids_str = ", ".join(vulns[:3])
+            msg     = f"Vulnérabilité ({eco}) : {name} v{version} → {ids_str}"
 
-            log_dict = {
-                "timestamp": datetime.datetime.utcnow().isoformat(),
-                "hostname": inventory.hostname,
-                "alert_message": msg,
-                "is_anomaly": True,
-                "remediation_action": "Mettre à jour le composant système",
-                "soc_source": "osquery_vulnerability_scanner"
-            }
-            logger.info(json.dumps(log_dict))
+            cur.execute(
+                "SELECT id FROM alerts WHERE hostname=%s AND alert_message=%s",
+                (inventory.hostname, msg),
+            )
+            if cur.fetchone():
+                continue
 
-    conn.commit()
-    cursor.close()
-    conn.close()
+            cur.execute("""
+                INSERT INTO alerts
+                    (hostname, process_name, pid, port, alert_message,
+                     is_anomaly, severity, risk_score, remediation_action)
+                VALUES (%s,'Vulnerability-Scanner',0,0,%s,TRUE,'HIGH',70,%s)
+            """, (inventory.hostname, msg, "Mettre à jour via apt/pip/npm"))
 
+            logger.info(json.dumps({
+                "timestamp":        datetime.datetime.utcnow().isoformat(),
+                "hostname":         inventory.hostname,
+                "alert_message":    msg,
+                "is_anomaly":       True,
+                "severity":         "HIGH",
+                "remediation_action": "Mettre à jour le composant",
+                "soc_source":       "osquery_vulnerability_scanner",
+            }))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     return {"status": "success", "vulnerabilities": total_vulns}
 
-def get_wazuh_alerts(token, limit=100):
-    url = f"{WAZUH_API_URL}/alerts/history?limit={limit}"
-    headers = {"Authorization": f"Bearer {token}"}    
-    resp = requests.get(url, headers=headers, verify=False) 
-    if resp.status_code == 200:
-        return resp.json()['data']['affected_items']
-    return []
 
 @app.get("/api/alerts/")
 def get_alerts(limit: int = 100):
+    """Retourne les alertes — Wazuh en priorité, BDD en fallback."""
     try:
-        token = get_wazuh_token()
-        wazuh_alerts = get_wazuh_alerts(token, limit)
-        formatted_alerts = []
-        for alert in wazuh_alerts:
-            original_log = alert.get('data', {}) 
-            
-            formatted_alerts.append({
-                "id": alert.get('id'),
-                "timestamp": alert.get('timestamp'),
-                "hostname": alert.get('agent', {}).get('name', 'Unknown'),
-                "process_name": original_log.get('process_name', 'Unknown'),
-                "pid": original_log.get('pid', '0'),
-                "port": original_log.get('port', 0),
-                "alert_message": alert.get('rule', {}).get('description', 'Unknown Alert'),
-                "is_anomaly": original_log.get('is_anomaly', False),
-                "remediation_action": original_log.get('remediation_action', ''),
-                "rule_level": alert.get('rule', {}).get('level', 0)
-            })
-        return formatted_alerts
-
+        if WAZUH_API_URL:
+            token = get_wazuh_token()
+            wazuh_alerts = get_wazuh_alerts(token, limit)
+            formatted = []
+            for a in wazuh_alerts:
+                d = a.get("data", {})
+                formatted.append({
+                    "id":               a.get("id"),
+                    "timestamp":        a.get("timestamp"),
+                    "hostname":         a.get("agent", {}).get("name", "Unknown"),
+                    "process_name":     d.get("process_name", "Unknown"),
+                    "pid":              d.get("pid", 0),
+                    "port":             d.get("port", 0),
+                    "alert_message":    a.get("rule", {}).get("description", ""),
+                    "is_anomaly":       d.get("is_anomaly", False),
+                    "severity":         d.get("severity", "INFO"),
+                    "risk_score":       d.get("risk_score", 0),
+                    "remediation_action": d.get("remediation_action", ""),
+                    "resolved":         False,
+                    "rule_level":       a.get("rule", {}).get("level", 0),
+                })
+            return formatted
     except Exception as e:
-        print(f"Error fetching from Wazuh: {e}. Falling back to DB.")
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor(cursor_factory=RealDictCursor) 
-            cursor.execute("SELECT * FROM alerts ORDER BY timestamp DESC LIMIT %s", (limit,))
-            rows = cursor.fetchall()
-            cursor.close()
-            conn.close()
-            return rows
-        except Exception as db_e:
-            raise HTTPException(status_code=500, detail=str(db_e))
+        print(f"[WARN] Wazuh inaccessible : {e} — fallback DB")
+
+    # Fallback PostgreSQL
+    try:
+        conn = get_db_connection()
+        cur  = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            "SELECT * FROM alerts ORDER BY timestamp DESC LIMIT %s", (limit,)
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/stats/")
 def get_stats():
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT COUNT(*) FROM alerts")
-        total = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM alerts WHERE is_anomaly = true")
-        anomalies = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(DISTINCT hostname) FROM alerts")
-        hosts = cursor.fetchone()[0]
-        
-        cursor.close()
+        cur  = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM alerts")
+        total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM alerts WHERE is_anomaly = TRUE")
+        anomalies = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(DISTINCT hostname) FROM alerts")
+        hosts = cur.fetchone()[0]
+        cur.execute(
+            "SELECT COUNT(*) FROM alerts WHERE is_anomaly=TRUE AND resolved=FALSE"
+        )
+        open_threats = cur.fetchone()[0]
+        cur.close()
         conn.close()
-        return {"total_alerts": total, "anomalies": anomalies, "unique_hosts": hosts}
+        return {
+            "total_alerts":  total,
+            "anomalies":     anomalies,
+            "unique_hosts":  hosts,
+            "open_threats":  open_threats,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+       
     
-def get_wazuh_token():
-    auth_url = f"{WAZUH_API_URL}/security/user/authenticate"
-    resp = requests.post(auth_url, auth=(WAZUH_API_USER, WAZUH_API_PASS), verify=False)
-    if resp.status_code == 200:
-        return resp.json()['data']['token']
-    raise Exception("Failed to authenticate with Wazuh API")
-
-def get_agent_id(hostname, token):
-    url = f"{WAZUH_API_URL}/agents?q=name={hostname}"
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(url, headers=headers, verify=False)
-    if resp.status_code == 200 and resp.json()['data']['affected_items']:
-        return resp.json()['data']['affected_items'][0]['id']
-    return None
-
 @app.post("/api/actions/kill/{pid}", status_code=200)
 def request_kill_process(pid: int, hostname: str = ""):
     try:
-        token = get_wazuh_token()
-        agent_id = get_agent_id(hostname, token)
-        
-        if not agent_id:
-            logger.warning(f"[WAZUH] Agent introuvable pour {hostname}. Remédiation ignorée.")
-            return {"status": "failed", "message": f"Agent Wazuh introuvable pour {hostname}"}
-
-        ar_url = f"{WAZUH_API_URL}/active-response?agents_list={agent_id}"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        payload = {
-            "command": "custom-kill",
-            "custom": True,
-            "arguments": [str(pid)] 
-        }
-        resp = requests.put(ar_url, headers=headers, json=payload, verify=False, timeout=5)
-        if resp.status_code == 200:
-            return {"status": "success", "message": f"Active response envoyée à l'agent {agent_id}"}
-        else:
-            logger.error(f"[WAZUH] Erreur Active Response (HTTP {resp.status_code}): {resp.text}")
-            return {"status": "failed", "message": f"Wazuh a refusé l'ordre (Erreur {resp.status_code})"}
-            
-    except requests.exceptions.RequestException as e:
-        logger.error(f"[WAZUH] Impossible de joindre le serveur Wazuh : {e}")
-        return {"status": "failed", "message": "Le serveur Wazuh est actuellement injoignable."}
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        cur.execute(
+            "INSERT INTO pending_actions (hostname, action, pid) VALUES (%s, %s, %s)",
+            (hostname, "kill", pid),
+        )
+        # Marquer resolved dans alerts
+        cur.execute(
+            "UPDATE alerts SET resolved=TRUE WHERE pid=%s AND hostname=%s AND resolved=FALSE",
+            (pid, hostname),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
     except Exception as e:
-        logger.error(f"[WAZUH] Exception inattendue lors de la remédiation : {e}")
-        return {"status": "failed", "message": "Erreur interne lors de la communication avec Wazuh."}
+        print(f"[WARN] DB pending_actions : {e}")
+
+    # Tentative Active Response Wazuh
+    if WAZUH_API_URL:
+        try:
+            token    = get_wazuh_token()
+            agent_id = get_agent_id(hostname, token)
+            if not agent_id:
+                return {"status": "queued", "message": f"Agent Wazuh introuvable pour {hostname} — ordre en file BDD"}
+
+            resp = requests.put(
+                f"{WAZUH_API_URL}/active-response?agents_list={agent_id}",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"command": "custom-kill", "custom": True, "arguments": [str(pid)]},
+                verify=WAZUH_VERIFY_TLS,
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                return {"status": "success", "message": f"Active Response envoyée à l'agent {agent_id}"}
+            return {"status": "queued", "message": f"Wazuh refus ({resp.status_code}) — ordre en file BDD"}
+        except Exception as e:
+            print(f"[WARN] Wazuh AR : {e}")
+            return {"status": "queued", "message": "Wazuh inaccessible — ordre en file BDD"}
+
+    return {"status": "queued", "message": "Mode sans Wazuh — ordre en file BDD"}
     
 @app.get("/api/actions/pending")
 def get_pending_actions():
-    """L'agent Osquery interrogera cette route pour savoir s'il doit agir."""
-    actions = pending_actions.copy()
-    pending_actions.clear() # Vider la file une fois récupérée par l'agent
-    return actions
+    """L'agent Osquery poll cette route pour récupérer ses ordres."""
+    try:
+        conn = get_db_connection()
+        cur  = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            "SELECT id, hostname, action, pid FROM pending_actions WHERE done=FALSE ORDER BY created_at"
+        )
+        actions = [dict(r) for r in cur.fetchall()]
+        if actions:
+            ids = [a["id"] for a in actions]
+            cur.execute(
+                f"UPDATE pending_actions SET done=TRUE WHERE id = ANY(%s)", (ids,)
+            )
+            conn.commit()
+        cur.close()
+        conn.close()
+        return actions
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+def health():
+    return {
+        "status":     "ok",
+        "ml_trained": detector.is_trained,
+        "wazuh":      bool(WAZUH_API_URL),
+    }
