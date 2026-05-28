@@ -5,6 +5,11 @@ import time
 import requests
 import socket
 import argparse
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_LOG_FILE =os.getenv("DB_LOG_FILE", "")
 
 API_URL = ""
 HOSTNAME = ""
@@ -21,6 +26,7 @@ SUSPICIOUS_PROCESSES = ["nc", "ncat", "netcat", "msfconsole", "python3", "bash"]
 SQL_KEYWORDS = ["SELECT", "INSERT", "DROP", "UPDATE", "DELETE"]
 
 SEEN_ALERTS = set()
+LOG_POINTERS = {}
 
 def execute_osquery(query):
     try:
@@ -58,7 +64,47 @@ def send_log(process_name, pid, port, message, bytes_sent=0, query_text=""):
             print(f"  [-] Erreur HTTP {r.status_code}")
     except Exception as e:
         print(f"  [!] Backend inaccessible : {e}")
+def init_log_pointers():
+    """Initialise le pointeur à la fin du fichier pour ne pas lire le passé."""
+    if os.path.exists(DB_LOG_FILE):
+        LOG_POINTERS[DB_LOG_FILE] = os.path.getsize(DB_LOG_FILE)
+        print(f"[*] Suivi du log BDD initialisé ({LOG_POINTERS[DB_LOG_FILE]} octets passés).")
+    else:
+        print(f"[!] Fichier de log BDD introuvable : {DB_LOG_FILE}")
+        LOG_POINTERS[DB_LOG_FILE] = 0
 
+def check_db_logs():
+    """ Lit incrémentalement le fichier de log de la base de données."""
+    if not os.path.exists(DB_LOG_FILE):
+        return
+
+    current_pointer = LOG_POINTERS.get(DB_LOG_FILE, 0)
+    current_size = os.path.getsize(DB_LOG_FILE)
+
+    if current_size < current_pointer:
+        current_pointer = 0
+
+    if current_pointer == current_size:
+        return # Rien de nouveau à lire
+
+    try:
+        with open(DB_LOG_FILE, 'r') as f:
+            f.seek(current_pointer)
+            new_lines = f.readlines()
+            # Mettre à jour le pointeur pour le prochain cycle
+            LOG_POINTERS[DB_LOG_FILE] = f.tell()
+
+            for line in new_lines:
+                # Filtrage simple (à adapter selon le format exact de tes logs)
+                line_upper = line.upper()
+                if "FATAL" in line_upper or "ERROR" in line_upper or any(kw in line_upper for kw in SQL_KEYWORDS):
+                    msg = f"Activité BDD suspecte : {line.strip()[:150]}..."
+                    print(f"[!] LOG BDD DETECTE : {msg}")
+                    # Envoi au backend (on attribue un faux PID pour la forme)
+                    send_log("postgres_daemon", 0, 5432, msg, query_text=line.strip())
+
+    except Exception as e:
+        print(f"[Erreur] Lecture du log BDD impossible : {e}")
 def check_ports():
     """Cas d'usage 1 - Ports sensibles en écoute (Dédoublonné)."""
     query = """
@@ -186,21 +232,7 @@ def check_software_inventory():
     except Exception as e:
         print(f"  [!] Backend inaccessible pour l'inventaire : {e}")  
                         
-def fetch_and_execute_actions():
-    """Interroge le backend pour voir si l'admin a cliqué sur le bouton Kill."""
-    try:
-        r = requests.get(f"{API_URL}/actions/pending", timeout=5) 
-        if r.status_code == 200:
-            actions = r.json()
-            for action in actions:
-                if action.get("action") == "kill":
-                    pid_to_kill = action.get("pid")
-                    print(f"[*] ORDRE REÇU DU BACKEND : Tuer le PID {pid_to_kill}")
-                    execute_kill(pid_to_kill)
-    except requests.exceptions.RequestException:
-        pass
 
-def execute_kill(pid):
     """Exécute la commande système pour tuer le processus."""
     try:
         # Tente de tuer le processus proprement, puis par la force
@@ -218,12 +250,12 @@ def agent_loop(interval_seconds=30):
         check_suspicious_processes()
         check_shell_history_for_sql()
         check_network_traffic()
+        check_db_logs()
         # L'inventaire logiciel change peu, on le lance 1 fois sur 10 cycles
         if cycle_count % 10 == 1:
             print("[*] Lancement de l'analyse d'inventaire logiciel (Supply Chain)...")
             check_software_inventory()
         print(f"[*] Prochain cycle dans {interval_seconds}s...")
-        #fetch_and_execute_actions()
         time.sleep(interval_seconds)
 
 if __name__ == "__main__":

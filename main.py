@@ -36,7 +36,9 @@ WAZUH_API_USER = os.getenv("WAZUH_API_USER", "")
 WAZUH_API_PASS = os.getenv("WAZUH_API_PASSWORD", "")
 
 if not WAZUH_API_URL or not WAZUH_API_USER:
-    print("[ERREUR] Configuration Wazuh manquante dans les variables d'environnement.")WAZUH_VERIFY_TLS = os.getenv("WAZUH_VERIFY_TLS", "False").lower() in ("true", "1", "t")
+    print("[ERREUR] Configuration Wazuh manquante dans les variables d'environnement.")
+
+WAZUH_VERIFY_TLS = os.getenv("WAZUH_VERIFY_TLS", "False").lower() in ("true", "1", "t")
 
 log_file_path = os.environ.get("SOC_LOG_PATH", "soc_alerts.json")
 logger = logging.getLogger("SOC_Logger")
@@ -224,6 +226,20 @@ def receive_log(log: LogEntry):
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (log_dict["timestamp"], log.hostname, log.process_name, log.pid, log.port, log.alert_message, result["is_anomaly"], result["severity"], result["risk_score"], result["ml_score"], result["rules_score"], result["remediation"], " | ".join(result["reasons"]), json.dumps(result["risk_axes"])))
         conn.commit()
+        logger.info(json.dumps({
+            "timestamp":          log_dict["timestamp"],
+            "hostname":           log.hostname,
+            "process_name":       log.process_name,
+            "pid":                int(log.pid),
+            "port":               int(log.port),
+            "alert_message":      log.alert_message,
+            "is_anomaly":         result["is_anomaly"],
+            "severity":           result["severity"],
+            "risk_score":         result["risk_score"],
+            "remediation_action": result["remediation"],
+            "reasons":            " | ".join(result["reasons"]),
+            "soc_source":         "ml_anomaly"  # Clé essentielle pour la règle Wazuh
+        }))
 
     cur.close()
     conn.close()
@@ -369,72 +385,6 @@ def get_stats():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
        
-    
-@app.post("/api/actions/kill/{pid}", status_code=200)
-def request_kill_process(pid: int, hostname: str = ""):
-    try:
-        conn = get_db_connection()
-        cur  = conn.cursor()
-        cur.execute(
-            "INSERT INTO pending_actions (hostname, action, pid) VALUES (%s, %s, %s)",
-            (hostname, "kill", pid),
-        )
-        # Marquer resolved dans alerts
-        cur.execute(
-            "UPDATE alerts SET resolved=TRUE WHERE pid=%s AND hostname=%s AND resolved=FALSE",
-            (pid, hostname),
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"[WARN] DB pending_actions : {e}")
-
-    # Tentative Active Response Wazuh
-    if WAZUH_API_URL:
-        try:
-            token    = get_wazuh_token()
-            agent_id = get_agent_id(hostname, token)
-            if not agent_id:
-                return {"status": "queued", "message": f"Agent Wazuh introuvable pour {hostname} — ordre en file BDD"}
-
-            resp = requests.put(
-                f"{WAZUH_API_URL}/active-response?agents_list={agent_id}",
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json={"command": "custom-kill", "custom": True, "arguments": [str(pid)]},
-                verify=WAZUH_VERIFY_TLS,
-                timeout=8,
-            )
-            if resp.status_code == 200:
-                return {"status": "success", "message": f"Active Response envoyée à l'agent {agent_id}"}
-            return {"status": "queued", "message": f"Wazuh refus ({resp.status_code}) — ordre en file BDD"}
-        except Exception as e:
-            print(f"[WARN] Wazuh AR : {e}")
-            return {"status": "queued", "message": "Wazuh inaccessible — ordre en file BDD"}
-
-    return {"status": "queued", "message": "Mode sans Wazuh — ordre en file BDD"}
-    
-@app.get("/api/actions/pending")
-def get_pending_actions():
-    """L'agent Osquery poll cette route pour récupérer ses ordres."""
-    try:
-        conn = get_db_connection()
-        cur  = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute(
-            "SELECT id, hostname, action, pid FROM pending_actions WHERE done=FALSE ORDER BY created_at"
-        )
-        actions = [dict(r) for r in cur.fetchall()]
-        if actions:
-            ids = [a["id"] for a in actions]
-            cur.execute(
-                f"UPDATE pending_actions SET done=TRUE WHERE id = ANY(%s)", (ids,)
-            )
-            conn.commit()
-        cur.close()
-        conn.close()
-        return actions
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 def health():
