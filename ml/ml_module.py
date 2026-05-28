@@ -10,7 +10,9 @@ from collections import defaultdict, deque
 import datetime
 import warnings
 warnings.filterwarnings('ignore')
- 
+from dotenv import load_dotenv
+
+load_dotenv()
 # CONSTANTES 
 RISK_THRESHOLDS = {
     "CRITICAL": 80,
@@ -32,11 +34,11 @@ SQL_DANGER = {"DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT"}
 SQL_EXFIL  = {"SELECT", "UNION", "INSERT", "EXPORT", "OUTFILE"}
  
 # Seuils de volume
-EXFIL_BYTES_CRITICAL = 100_000   # 100 KB → suspect
-EXFIL_BYTES_HIGH     = 50_000    # 50 KB → à surveiller
-BURST_REQUESTS_WARN  = 60        # >60 req/min → anormal
-BURST_REQUESTS_CRIT  = 200       # >200 req/min → attaque probable
-PORT_ENTROPY_HIGH    = 10        # >10 ports distincts contactés → scan
+EXFIL_BYTES_CRITICAL = int(os.getenv("EXFIL_BYTES_CRITICAL", 10_000_000))
+EXFIL_BYTES_HIGH     = int(os.getenv("EXFIL_BYTES_HIGH", 50_000_000))
+BURST_REQUESTS_WARN  = int(os.getenv("BURST_REQUESTS_WARN", 60))
+BURST_REQUESTS_CRIT  = int(os.getenv("BURST_REQUESTS_CRIT", 200))
+PORT_ENTROPY_HIGH    = int(os.getenv("PORT_ENTROPY_HIGH", 10))
  
 FEATURE_COLUMNS = [
     # Volume

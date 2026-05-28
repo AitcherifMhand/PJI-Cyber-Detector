@@ -11,6 +11,7 @@ import requests
 import os
 from ml.ml_module import CyberAnomalyDetector
 from typing import Optional
+from dotenv import load_dotenv
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -28,19 +29,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+load_dotenv()
 # --- WAZUH CONFIGURATION ---
-wazuh_config = configparser.ConfigParser()
-wazuh_config.read('wazuh.config')
-try:
-    WAZUH_API_URL = wazuh_config['wazuh']['url']
-    WAZUH_API_USER = wazuh_config['wazuh']['user']
-    WAZUH_API_PASS = wazuh_config['wazuh']['password']
-    WAZUH_VERIFY_TLS = wazuh_config["wazuh"].getboolean("verify_tls", fallback=False)
+WAZUH_API_URL = os.getenv("WAZUH_API_URL", "")
+WAZUH_API_USER = os.getenv("WAZUH_API_USER", "")
+WAZUH_API_PASS = os.getenv("WAZUH_API_PASSWORD", "")
 
-except KeyError as e:
-    print(f"[ERREUR] Configuration Wazuh manquante dans wazuh.config: {e}")
-    WAZUH_API_URL = WAZUH_API_USER = WAZUH_API_PASS = ""
-    WAZUH_VERIFY_TLS = False
+if not WAZUH_API_URL or not WAZUH_API_USER:
+    print("[ERREUR] Configuration Wazuh manquante dans les variables d'environnement.")WAZUH_VERIFY_TLS = os.getenv("WAZUH_VERIFY_TLS", "False").lower() in ("true", "1", "t")
 
 log_file_path = os.environ.get("SOC_LOG_PATH", "soc_alerts.json")
 logger = logging.getLogger("SOC_Logger")
@@ -53,11 +49,11 @@ config = configparser.ConfigParser()
 config.read('db.config')
 
 DB_CONFIG = {
-    "dbname": config['postgresql']['dbname'],
-    "user": config['postgresql']['user'],
-    "password": config['postgresql']['password'],
-    "host": config['postgresql']['host'],
-    "port": config['postgresql']['port']
+    "dbname": os.getenv("DB_NAME", "soc_db"),
+    "user": os.getenv("DB_USER", "postgres"),
+    "password": os.getenv("DB_PASSWORD", ""),
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": os.getenv("DB_PORT", "5432")
 }
 class InventoryEntry(BaseModel):
     hostname: str
