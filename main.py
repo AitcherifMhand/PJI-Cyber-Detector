@@ -13,6 +13,9 @@ from ml.ml_module import CyberAnomalyDetector
 from typing import Optional
 from dotenv import load_dotenv
 import urllib3
+
+load_dotenv()
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Chargement du modèle ML
@@ -22,14 +25,14 @@ detector = CyberAnomalyDetector.load_model(ML_MODEL_PATH)
 
 app = FastAPI(title="SOC Cyber-Detector API", description="API avec PostgreSQL")
 
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://localhost:8080").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["*"],
 )
-load_dotenv()
 # --- WAZUH CONFIGURATION ---
 WAZUH_API_URL = os.getenv("WAZUH_API_URL", "")
 WAZUH_API_USER = os.getenv("WAZUH_API_USER", "")
@@ -127,11 +130,15 @@ def init_db():
             )
         """)
         conn.commit()
-        cur.close()
-        conn.close()
         print("[OK] Base de données PostgreSQL initialisée.")
     except Exception as e:
         print(f"[ERREUR] Impossible de se connecter à PostgreSQL : {e}")
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
 
 init_db()
 
@@ -161,7 +168,7 @@ def get_agent_id(hostname: str, token: str) -> Optional[str]:
 
 def get_wazuh_alerts(token: str, limit: int = 100) -> list:
     resp = requests.get(
-        f"{WAZUH_API_URL}/alerts/history?limit={limit}",
+        f"{WAZUH_API_URL}/alerts?limit={limit}",
         headers={"Authorization": f"Bearer {token}"},
         verify=WAZUH_VERIFY_TLS,
         timeout=10,
@@ -358,6 +365,7 @@ def get_alerts(limit: int = 100):
         return rows
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/stats/")
 def get_stats():

@@ -5,6 +5,7 @@ import time
 import requests
 import socket
 import argparse
+import os
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -232,14 +233,6 @@ def check_software_inventory():
     except Exception as e:
         print(f"  [!] Backend inaccessible pour l'inventaire : {e}")  
                         
-
-    """Exécute la commande système pour tuer le processus."""
-    try:
-        # Tente de tuer le processus proprement, puis par la force
-        subprocess.run(['kill', '-9', str(pid)], capture_output=True, text=True)
-        print(f"  [+] PID {pid} terminé avec succès.")
-    except Exception as e:
-        print(f"  [-] Échec lors de la destruction du PID {pid}: {e}")
 def agent_loop(interval_seconds=30):
     print(f"[*] Agent SOC démarré — cycle toutes les {interval_seconds}s.")
     cycle_count = 0
