@@ -6,6 +6,8 @@ from psycopg2.extras import RealDictCursor
 import datetime
 import configparser
 import logging
+import logging.handlers
+import socket
 import json
 import requests
 import os
@@ -13,6 +15,7 @@ from ml.ml_module import CyberAnomalyDetector
 from typing import Optional
 from dotenv import load_dotenv
 import urllib3
+
 
 load_dotenv()
 
@@ -34,14 +37,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 # --- WAZUH CONFIGURATION ---
-WAZUH_API_URL = os.getenv("WAZUH_API_URL", "")
+WAZUH_API_URL  = os.getenv("WAZUH_API_URL", "")
 WAZUH_API_USER = os.getenv("WAZUH_API_USER", "")
 WAZUH_API_PASS = os.getenv("WAZUH_API_PASSWORD", "")
+WAZUH_VERIFY_TLS = os.getenv("WAZUH_VERIFY_TLS", "False").lower() in ("true", "1", "t")
+WAZUH_SYSLOG_HOST = os.getenv("WAZUH_SYSLOG_HOST", "")   # ex: "192.168.1.10"
+WAZUH_SYSLOG_PORT = int(os.getenv("WAZUH_SYSLOG_PORT", "514"))
 
 if not WAZUH_API_URL or not WAZUH_API_USER:
     print("[ERREUR] Configuration Wazuh manquante dans les variables d'environnement.")
 
-WAZUH_VERIFY_TLS = os.getenv("WAZUH_VERIFY_TLS", "False").lower() in ("true", "1", "t")
 
 log_file_path = os.environ.get("SOC_LOG_PATH", "soc_alerts.json")
 logger = logging.getLogger("SOC_Logger")
@@ -49,6 +54,23 @@ logger.setLevel(logging.INFO)
 handler = logging.FileHandler(log_file_path)
 handler.setFormatter(logging.Formatter('%(message)s'))
 logger.addHandler(handler)
+# Handler syslog UDP → Wazuh manager
+if WAZUH_SYSLOG_HOST:
+    try:
+        syslog_handler = logging.handlers.SysLogHandler(
+            address=(WAZUH_SYSLOG_HOST, WAZUH_SYSLOG_PORT),
+            socktype=socket.SOCK_DGRAM,
+        )
+        syslog_handler.setFormatter(logging.Formatter('%(message)s'))
+        logger.addHandler(syslog_handler)
+        print(f"[OK] Syslog Wazuh activé → {WAZUH_SYSLOG_HOST}:{WAZUH_SYSLOG_PORT}")
+    except Exception as e:
+        print(f"[WARN] Impossible d'initialiser le handler syslog : {e}")
+else:
+    print("[INFO] WAZUH_SYSLOG_HOST non défini — syslog désactivé (fichier local uniquement)")
+
+
+
 # --- CONFIGURATION POSTGRESQL ---
 config = configparser.ConfigParser()
 config.read('db.config')
@@ -117,16 +139,6 @@ def init_db():
                 risk_axes         TEXT,
                 bytes_sent        BIGINT DEFAULT 0,
                 remote_ip         VARCHAR(64)
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS pending_actions (
-                id          SERIAL PRIMARY KEY,
-                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                hostname    VARCHAR(255),
-                action      VARCHAR(64),
-                pid         INTEGER,
-                done        BOOLEAN DEFAULT FALSE
             )
         """)
         conn.commit()
@@ -201,11 +213,47 @@ def get_host_behavior_window(hostname: str) -> dict:
     conn.close()
     
     return dict(window_data)
+
+def format_wazuh_alert(a: dict) -> dict:
+    """Convertit une alerte brute Wazuh API en dict dashboard."""
+    d = a.get("data", {})
+    return {
+        "id":                 a.get("id"),
+        "timestamp":          a.get("timestamp"),
+        "hostname":           a.get("agent", {}).get("name", "Unknown"),
+        "process_name":       d.get("process_name", "Unknown"),
+        "pid":                d.get("pid", 0),
+        "port":               d.get("port", 0),
+        "alert_message":      a.get("rule", {}).get("description", ""),
+        "is_anomaly":         d.get("is_anomaly", False),
+        "severity":           d.get("severity", "INFO"),
+        "risk_score":         d.get("risk_score", 0),
+        "remediation_action": d.get("remediation_action", ""),
+        "resolved":           False,
+        "rule_level":         a.get("rule", {}).get("level", 0),
+        "soc_source":         d.get("soc_source", ""),
+    }
+
+def build_alert_payload(log_dict: dict, result: dict) -> str:
+    """Construit le JSON envoyé à Wazuh via syslog et écrit dans le fichier local."""
+    return json.dumps({
+        "timestamp":          log_dict["timestamp"],
+        "hostname":           log_dict["hostname"],
+        "process_name":       log_dict["process_name"],
+        "pid":                int(log_dict["pid"]),
+        "port":               int(log_dict["port"]),
+        "alert_message":      log_dict["alert_message"],
+        "is_anomaly":         result["is_anomaly"],
+        "severity":           result["severity"],
+        "risk_score":         result["risk_score"],
+        "remediation_action": result["remediation"],
+        "reasons":            " | ".join(result["reasons"]),
+        "soc_source":         "ml_anomaly",
+    })
+    
 @app.post("/api/logs/", status_code=201)
 def receive_log(log: LogEntry):
     """Point d'entrée principal de l'agent Osquery."""
-
-    # Horodatage de réception si absent
     log_dict = log.dict()
     if not log_dict.get("timestamp"):
         log_dict["timestamp"] = datetime.datetime.utcnow().isoformat()
@@ -233,26 +281,13 @@ def receive_log(log: LogEntry):
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (log_dict["timestamp"], log.hostname, log.process_name, log.pid, log.port, log.alert_message, result["is_anomaly"], result["severity"], result["risk_score"], result["ml_score"], result["rules_score"], result["remediation"], " | ".join(result["reasons"]), json.dumps(result["risk_axes"])))
         conn.commit()
-        logger.info(json.dumps({
-            "timestamp":          log_dict["timestamp"],
-            "hostname":           log.hostname,
-            "process_name":       log.process_name,
-            "pid":                int(log.pid),
-            "port":               int(log.port),
-            "alert_message":      log.alert_message,
-            "is_anomaly":         result["is_anomaly"],
-            "severity":           result["severity"],
-            "risk_score":         result["risk_score"],
-            "remediation_action": result["remediation"],
-            "reasons":            " | ".join(result["reasons"]),
-            "soc_source":         "ml_anomaly"  # Clé essentielle pour la règle Wazuh
-        }))
+        
+        logger.info(build_alert_payload(log_dict, result))
 
     cur.close()
     conn.close()
     
-    return {"status": "success", "is_anomaly": result["is_anomaly"]}
-    
+     
 def check_osv_vulnerabilities_batch(packages):
     """Interroge l'API Google OSV en utilisant l'endpoint /v1/querybatch avec découpage par lots."""
     queries = [
@@ -322,35 +357,21 @@ def receive_inventory(inventory: InventoryEntry):
 
 
 @app.get("/api/alerts/")
-def get_alerts(limit: int = 100):
+def get_alerts(limit: int = 100, source: Optional[str] = None):
     """Retourne les alertes — Wazuh en priorité, BDD en fallback."""
-    try:
-        if WAZUH_API_URL:
+    if WAZUH_API_URL:
+        try:
             token = get_wazuh_token()
             wazuh_alerts = get_wazuh_alerts(token, limit)
-            if wazuh_alerts:   
-                formatted = []
-                for a in wazuh_alerts:
-                    d = a.get("data", {})
-                    formatted.append({
-                        "id":               a.get("id"),
-                        "timestamp":        a.get("timestamp"),
-                        "hostname":         a.get("agent", {}).get("name", "Unknown"),
-                        "process_name":     d.get("process_name", "Unknown"),
-                        "pid":              d.get("pid", 0),
-                        "port":             d.get("port", 0),
-                        "alert_message":    a.get("rule", {}).get("description", ""),
-                        "is_anomaly":       d.get("is_anomaly", False),
-                        "severity":         d.get("severity", "INFO"),
-                        "risk_score":       d.get("risk_score", 0),
-                        "remediation_action": d.get("remediation_action", ""),
-                        "resolved":         False,
-                        "rule_level":       a.get("rule", {}).get("level", 0),
-                    })
-                return formatted
+            formatted = [format_wazuh_alert(a) for a in wazuh_alerts]
+            
+            # Filtre optionnel par source
+            if source:
+                formatted = [a for a in formatted if a.get("soc_source") == source]
+                
             return formatted
-    except Exception as e:
-        print(f"[WARN] Wazuh inaccessible : {e} — fallback DB")
+        except Exception as e:
+            print(f"[WARN] Wazuh inaccessible : {e} — fallback DB")
 
     # Fallback PostgreSQL
     try:
@@ -365,7 +386,6 @@ def get_alerts(limit: int = 100):
         return rows
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/api/stats/")
 def get_stats():
@@ -397,7 +417,9 @@ def get_stats():
 @app.get("/health")
 def health():
     return {
-        "status":     "ok",
-        "ml_trained": detector.is_trained,
-        "wazuh":      bool(WAZUH_API_URL),
+        "status":         "ok",
+        "ml_trained":     detector.is_trained,
+        "wazuh_api":      bool(WAZUH_API_URL),
+        "wazuh_syslog":   bool(WAZUH_SYSLOG_HOST),
+        "syslog_target":  f"{WAZUH_SYSLOG_HOST}:{WAZUH_SYSLOG_PORT}" if WAZUH_SYSLOG_HOST else "disabled",
     }
