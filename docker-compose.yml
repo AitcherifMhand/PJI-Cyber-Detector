@@ -1,0 +1,68 @@
+services:
+  # Base de données PostgreSQL
+  db:
+    image: postgres:16-alpine
+    container_name: soc_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${DB_NAME:-soc_db}
+      POSTGRES_USER:     ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD est requis}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-soc_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  # Backend FastAPI
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: soc_backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_NAME:          ${DB_NAME:-soc_db}
+      DB_USER:          ${DB_USER:-postgres}
+      DB_PASSWORD:      ${DB_PASSWORD:?DB_PASSWORD est requis}
+      DB_HOST:          db
+      DB_PORT:          5432
+      ML_MODEL_PATH:    /app/ml_behavioral_model.joblib
+      SOC_LOG_PATH:     /app/logs/soc_alerts.json
+      CORS_ORIGINS:     ${CORS_ORIGINS:-http://localhost:8080}
+      WAZUH_API_URL:    ${WAZUH_API_URL:-}
+      WAZUH_API_USER:   ${WAZUH_API_USER:-}
+      WAZUH_API_PASSWORD: ${WAZUH_API_PASSWORD:-}
+      WAZUH_VERIFY_TLS: ${WAZUH_VERIFY_TLS:-true}
+    volumes:
+      - ./logs:/app/logs
+      - ./ml_behavioral_model.joblib:/app/ml_behavioral_model.joblib:ro
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  # Frontend 
+  frontend:
+    image: nginx:1.27-alpine
+    container_name: soc_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    volumes:
+      - ./index.html:/usr/share/nginx/html/index.html:ro
+      - ./style.css:/usr/share/nginx/html/style.css:ro
+      - ./script.js:/usr/share/nginx/html/script.js:ro
+    ports:
+      - "8080:80"
+
+volumes:
+  postgres_data:

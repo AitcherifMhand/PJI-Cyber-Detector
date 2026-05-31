@@ -20,4 +20,7 @@ pyvenv.cfg
 !*.txt
 !*.md
 !*.css
+!*.xml
+!*.yml
 !.gitignore
+
