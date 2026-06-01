@@ -378,7 +378,7 @@ def get_alerts(limit: int = 100, source: Optional[str] = None):
         conn = get_db_connection()
         cur  = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(
-            "SELECT * FROM alerts ORDER BY timestamp DESC LIMIT %s", (limit,)
+            "SELECT * FROM alerts WHERE resolved = FALSE ORDER BY timestamp DESC LIMIT %s", (limit,)
         )
         rows = [dict(r) for r in cur.fetchall()]
         cur.close()
@@ -387,6 +387,31 @@ def get_alerts(limit: int = 100, source: Optional[str] = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.patch("/api/alerts/{alert_identifier}/resolve")
+def resolve_alert(alert_identifier: str):
+    """Marks an alert as resolved in the database so it leaves the active SOC queue."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # We try to resolve by ID if it's an integer, or fallback to PID if the ID wasn't available
+        if alert_identifier.isdigit():
+            cur.execute("""
+                UPDATE alerts 
+                SET resolved = TRUE 
+                WHERE id = %s OR pid = %s
+            """, (int(alert_identifier), int(alert_identifier)))
+        else:
+            cur.execute("UPDATE alerts SET resolved = TRUE WHERE id::text = %s", (alert_identifier,))
+            
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return {"status": "success", "message": "Alerte acquittée"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
 @app.get("/api/stats/")
 def get_stats():
     try:
@@ -423,3 +448,4 @@ def health():
         "wazuh_syslog":   bool(WAZUH_SYSLOG_HOST),
         "syslog_target":  f"{WAZUH_SYSLOG_HOST}:{WAZUH_SYSLOG_PORT}" if WAZUH_SYSLOG_HOST else "disabled",
     }
+

@@ -46,33 +46,35 @@ function setFilter(filter, btn) {
 
 function renderAlertsTable() {
   const tbody = document.getElementById("alerts-body");
-  let data = allAlerts;
+  
+  // 1. On filtre d'abord pour ne garder que les alertes actives (non résolues)
+  let data = allAlerts.filter(a => !a.resolved);
 
+  // 2. On applique ensuite les filtres d'affichage de l'interface
   if (currentFilter === "anomalie")
-    data = allAlerts.filter((a) => a.is_anomaly);
+    data = data.filter((a) => a.is_anomaly);
   else if (currentFilter === "port")
-    data = allAlerts.filter((a) => a.port === 4444 || a.port === 1337 || a.port === 22);
+    data = data.filter((a) => a.port === 4444 || a.port === 1337 || a.port === 22);
 
+  // 3. Gestion de l'état vide
   if (!data.length) {
-    tbody.innerHTML = '<div class="empty-state">Aucune alerte à afficher.</div>';
+    tbody.innerHTML = '<div class="empty-state">Aucune alerte active à afficher.</div>';
     return;
   }
 
+  // 4. Génération des lignes du tableau
   const rows = data
     .slice(0, 30)
     .map((a) => {
-      const isResolved = a.resolved;
-      
       const risk = a.risk_score !== undefined ? a.risk_score : 0;
       const mlScore = a.ml_score !== undefined ? a.ml_score : 0;
       const rulesScore = a.rules_score !== undefined ? a.rules_score : 0;
       
       const riskColor = risk >= 60 ? "var(--red)" : risk >= 30 ? "var(--amber)" : "var(--green)";
-
       const mlDetails = a.reasons ? `<div style="font-size: 11px; color: var(--amber); margin-top: 6px; font-weight: 500;">🤖 IA : ${a.reasons}</div>` : "";
 
       return `
-        <tr class="${isResolved ? "row-resolved" : ""}" id="row-${a.pid}">
+        <tr id="row-${a.pid}">
             <td style="white-space: nowrap;">${new Date(a.timestamp).toLocaleString("fr-FR")}</td>
             <td><strong>${a.hostname}</strong></td>
             <td>
@@ -93,13 +95,17 @@ function renderAlertsTable() {
                 </div>
             </td>
             <td>
-                <span id="badge-${a.pid}" class="badge ${isResolved ? "badge-resolved" : a.is_anomaly ? "badge-anomaly" : "badge-normal"}">
-                    ${isResolved ? "✓ Mitigé" : a.is_anomaly ? "Anomalie" : "Normal"}
+                <span id="badge-${a.pid}" class="badge ${a.is_anomaly ? "badge-anomaly" : "badge-normal"}">
+                    ${a.is_anomaly ? "Anomalie" : "Normal"}
                 </span>
             </td>
             <td style="font-size: 12px;">${a.remediation_action || "—"}</td>
             <td>
-                ${a.is_anomaly ? `<button id="btn-${a.pid}" class="btn-primary ${isResolved ? "btn-disabled" : ""}" style="font-size:11px; padding:6px 10px;" onclick="killProcess('${a.pid}', '${a.hostname}')" ${isResolved ? "disabled" : ""}>${isResolved ? "Résolu" : "Kill"}</button>` : ""}
+                <button class="btn-primary" 
+                        style="font-size:11px; padding:6px 10px; background: var(--amber); border: none; color: #000; font-weight: 600;" 
+                        onclick="dismissAlert('${a.id || a.pid}')">
+                    Acquitter
+                </button>
             </td>
         </tr>
     `;
@@ -122,62 +128,50 @@ function renderAlertsTable() {
             <tbody>${rows}</tbody>
         </table>`;
 }
+async function dismissAlert(alertIdentifier) {
+  const alertIndex = allAlerts.findIndex(
+    (a) => a.id == alertIdentifier || a.pid == alertIdentifier,
+  );
+  if (alertIndex === -1) return;
 
-async function killProcess(pid, hostname) {
+  const targetAlert = allAlerts[alertIndex];
+
   if (
     !confirm(
-      `Confirmer la destruction du processus suspect PID ${pid} sur ${hostname} ?`,
+      `Confirmer l'acquittement de l'alerte pour le processus ${targetAlert.process_name || "sélectionné"} ?`,
     )
   )
     return;
 
-  const btn = document.getElementById(`btn-${pid}`);
-  btn.textContent = "En cours...";
-  btn.classList.add("btn-disabled");
+  allAlerts.splice(alertIndex, 1);
+
+  renderAll();
+
+  document.getElementById("m-last-action").textContent = `Alerte clôturée`;
+  document.getElementById("m-last-time").textContent =
+    new Date().toLocaleTimeString("fr-FR");
+
+  let currentAnomalies = parseInt(
+    document.getElementById("m-anomalies").textContent,
+  );
+  if (!isNaN(currentAnomalies) && currentAnomalies > 0) {
+    document.getElementById("m-anomalies").textContent = currentAnomalies - 1;
+  }
 
   try {
     const resp = await fetch(
-      `${API_BASE}/api/actions/kill/${pid}?hostname=${hostname}`,
-      { method: "POST" },
+      `${API_BASE}/api/alerts/${alertIdentifier}/resolve`,
+      {
+        method: "PATCH",
+      },
     );
-
-    if (resp.ok) {
-      const targetAlert = allAlerts.find((a) => a.pid == pid);
-      if (targetAlert) targetAlert.resolved = true;
-
-      document.getElementById(`row-${pid}`).classList.add("row-resolved");
-
-      const badge = document.getElementById(`badge-${pid}`);
-      badge.className = "badge badge-resolved";
-      badge.textContent = "✓ Mitigé";
-
-      btn.textContent = "Résolu";
-      btn.disabled = true;
-
-      document.getElementById("m-last-action").textContent =
-        `PID ${pid} neutralisé`;
-      document.getElementById("m-last-time").textContent =
-        new Date().toLocaleTimeString();
-
-      let currentAnomalies = parseInt(
-        document.getElementById("m-anomalies").textContent,
-      );
-      if (!isNaN(currentAnomalies) && currentAnomalies > 0) {
-        document.getElementById("m-anomalies").textContent =
-          currentAnomalies - 1;
-      }
-    } else {
-      throw new Error("API refusée");
-    }
+    if (!resp.ok) throw new Error("Échec de l'acquittement");
   } catch (e) {
-    alert(
-      `Échec de la remédiation pour le PID ${pid}. Vérifiez la connexion Wazuh.`,
+    console.warn(
+      "Échec de la persistance côté serveur, l'alerte pourrait réapparaître au prochain rafraîchissement.",
     );
-    btn.textContent = "Kill";
-    btn.classList.remove("btn-disabled");
   }
 }
-
 function renderCharts() {
   const hostCounts = {};
   allAlerts.forEach((a) => {

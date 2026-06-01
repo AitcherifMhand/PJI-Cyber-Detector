@@ -1,18 +1,18 @@
 <group name="soc_cyberdetector,">
 
-  <rule id="100001" level="10">
+  <rule id="300001" level="10">
     <decoded_as>json</decoded_as>
     <field name="soc_source">ml_anomaly</field>
     <description>SOC Cyber-Detector: anomalie ML détectée sur $(hostname)</description>
   </rule>
 
-  <rule id="100002" level="13">
+  <rule id="300002" level="13">
     <if_sid>100001</if_sid>
     <field name="severity">CRITICAL</field>
     <description>SOC Cyber-Detector: anomalie CRITIQUE - $(alert_message)</description>
   </rule>
 
-  <rule id="100003" level="10">
+  <rule id="300003" level="10">
     <decoded_as>json</decoded_as>
     <field name="soc_source">osquery_vulnerability_scanner</field>
     <description>SOC Cyber-Detector: vulnérabilité supply chain sur $(hostname)</description>
