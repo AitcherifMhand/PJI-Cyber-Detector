@@ -237,18 +237,18 @@ def format_wazuh_alert(a: dict) -> dict:
 def build_alert_payload(log_dict: dict, result: dict) -> str:
     """Construit le JSON envoyé à Wazuh via syslog et écrit dans le fichier local."""
     return json.dumps({
-        "timestamp":          log_dict["timestamp"],
-        "hostname":           log_dict["hostname"],
-        "process_name":       log_dict["process_name"],
-        "pid":                int(log_dict["pid"]),
-        "port":               int(log_dict["port"]),
-        "alert_message":      log_dict["alert_message"],
-        "is_anomaly":         result["is_anomaly"],
-        "severity":           result["severity"],
-        "risk_score":         result["risk_score"],
-        "remediation_action": result["remediation"],
-        "reasons":            " | ".join(result["reasons"]),
-        "soc_source":         "ml_anomaly",
+        "soc_timestamp":          log_dict["timestamp"],
+        "soc_hostname":           log_dict["hostname"],
+        "soc_process_name":       log_dict["process_name"],
+        "soc_pid":                int(log_dict["pid"]),
+        "soc_port":               int(log_dict["port"]),
+        "soc_alert_message":      log_dict["alert_message"],
+        "soc_is_anomaly":         result["is_anomaly"],
+        "soc_severity":           result["severity"],
+        "soc_risk_score":         result["risk_score"],
+        "soc_remediation_action": result["remediation"],
+        "soc_reasons":            " | ".join(result["reasons"]),
+        "soc_source":             "ml_anomaly",
     })
     
 @app.post("/api/logs/", status_code=201)
@@ -286,6 +286,11 @@ def receive_log(log: LogEntry):
 
     cur.close()
     conn.close()
+    return {
+        "status": "success",
+        "is_anomaly": result["is_anomaly"],
+        "remediation": result["remediation"]
+    }
     
      
 def check_osv_vulnerabilities_batch(packages):
@@ -340,13 +345,13 @@ def receive_inventory(inventory: InventoryEntry):
             """, (inventory.hostname, msg, "Mettre à jour via apt/pip/npm"))
 
             logger.info(json.dumps({
-                "timestamp":        datetime.datetime.utcnow().isoformat(),
-                "hostname":         inventory.hostname,
-                "alert_message":    msg,
-                "is_anomaly":       True,
-                "severity":         "HIGH",
-                "remediation_action": "Mettre à jour le composant",
-                "soc_source":       "osquery_vulnerability_scanner",
+                "soc_timestamp":        datetime.datetime.utcnow().isoformat(),
+                "soc_hostname":         inventory.hostname,
+                "soc_alert_message":    msg,
+                "soc_is_anomaly":       True,
+                "soc_severity":         "HIGH",
+                "soc_remediation_action": "Mettre à jour le composant",
+                "soc_source":           "osquery_vulnerability_scanner",
             }))
         conn.commit()
         cur.close()
