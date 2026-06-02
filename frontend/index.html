@@ -69,10 +69,10 @@
         </div>
       </section>
 
-      <section class="alerts-panel">
+      <section class="alerts-panel" id="security-alerts-panel">
         <div class="alert-header">
           <h2 class="section-title" style="margin: 0">
-            Journal des alertes & remédiations
+            Journal des alertes de sécurité (Heuristique & ML)
           </h2>
           <div class="filter-group">
             <button class="filter-btn active" onclick="setFilter('Tous', this)">
@@ -87,7 +87,18 @@
           </div>
         </div>
         <div id="alerts-body">
-          <div class="empty-state">Chargement des alertes...</div>
+          <div class="empty-state">Chargement des alertes de sécurité...</div>
+        </div>
+      </section>
+
+      <section class="alerts-panel" id="vulnerabilities-panel">
+        <div class="alert-header">
+          <h2 class="section-title" style="margin: 0">
+            Inventaire des vulnérabilités logicielles (Supply Chain)
+          </h2>
+        </div>
+        <div id="vulnerabilities-body">
+          <div class="empty-state">Chargement des vulnérabilités...</div>
         </div>
       </section>
 

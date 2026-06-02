@@ -46,35 +46,42 @@ function setFilter(filter, btn) {
 
 function renderAlertsTable() {
   const tbody = document.getElementById("alerts-body");
-  
-  // 1. On filtre d'abord pour ne garder que les alertes actives (non résolues)
-  let data = allAlerts.filter(a => !a.resolved);
 
-  // 2. On applique ensuite les filtres d'affichage de l'interface
-  if (currentFilter === "anomalie")
-    data = data.filter((a) => a.is_anomaly);
+  let data = allAlerts.filter(
+    (a) => !a.resolved && a.process_name !== "Vulnerability-Scanner",
+  );
+
+  if (currentFilter === "anomalie") data = data.filter((a) => a.is_anomaly);
   else if (currentFilter === "port")
-    data = data.filter((a) => a.port === 4444 || a.port === 1337 || a.port === 22);
+    data = data.filter(
+      (a) => a.port === 4444 || a.port === 1337 || a.port === 22,
+    );
 
-  // 3. Gestion de l'état vide
   if (!data.length) {
-    tbody.innerHTML = '<div class="empty-state">Aucune alerte active à afficher.</div>';
+    tbody.innerHTML =
+      '<div class="empty-state">Aucune alerte de sécurité active à afficher.</div>';
     return;
   }
 
-  // 4. Génération des lignes du tableau
   const rows = data
     .slice(0, 30)
     .map((a) => {
       const risk = a.risk_score !== undefined ? a.risk_score : 0;
       const mlScore = a.ml_score !== undefined ? a.ml_score : 0;
       const rulesScore = a.rules_score !== undefined ? a.rules_score : 0;
-      
-      const riskColor = risk >= 60 ? "var(--red)" : risk >= 30 ? "var(--amber)" : "var(--green)";
-      const mlDetails = a.reasons ? `<div style="font-size: 11px; color: var(--amber); margin-top: 6px; font-weight: 500;">🤖 IA : ${a.reasons}</div>` : "";
+
+      const riskColor =
+        risk >= 60
+          ? "var(--red)"
+          : risk >= 30
+            ? "var(--amber)"
+            : "var(--green)";
+      const mlDetails = a.reasons
+        ? `<div style="font-size: 11px; color: var(--amber); margin-top: 6px; font-weight: 500;">🤖 IA : ${a.reasons}</div>`
+        : "";
 
       return `
-        <tr id="row-${a.pid}">
+        <tr id="row-${a.id || a.pid}">
             <td style="white-space: nowrap;">${new Date(a.timestamp).toLocaleString("fr-FR")}</td>
             <td><strong>${a.hostname}</strong></td>
             <td>
@@ -95,11 +102,11 @@ function renderAlertsTable() {
                 </div>
             </td>
             <td>
-                <span id="badge-${a.pid}" class="badge ${a.is_anomaly ? "badge-anomaly" : "badge-normal"}">
+                <span id="badge-${a.id || a.pid}" class="badge ${a.is_anomaly ? "badge-anomaly" : "badge-normal"}">
                     ${a.is_anomaly ? "Anomalie" : "Normal"}
                 </span>
             </td>
-            <td style="font-size: 12px;">${a.remediation_action || "—"}</td>
+            <td>${a.remediation_action || "—"}</td>
             <td>
                 <button class="btn-primary" 
                         style="font-size:11px; padding:6px 10px; background: var(--amber); border: none; color: #000; font-weight: 600;" 
@@ -128,6 +135,71 @@ function renderAlertsTable() {
             <tbody>${rows}</tbody>
         </table>`;
 }
+
+function renderVulnerabilitiesTable() {
+  const tbody = document.getElementById("vulnerabilities-body");
+
+  let data = allAlerts.filter(
+    (a) => !a.resolved && a.process_name === "Vulnerability-Scanner",
+  );
+
+  if (!data.length) {
+    tbody.innerHTML =
+      '<div class="empty-state">Aucune vulnérabilité applicative détectée sur le parc.</div>';
+    return;
+  }
+
+  const rows = data
+    .map((a) => {
+      const risk = a.risk_score !== undefined ? a.risk_score : 0;
+      const riskColor =
+        risk >= 60
+          ? "var(--red)"
+          : risk >= 30
+            ? "var(--amber)"
+            : "var(--green)";
+
+      return `
+        <tr id="row-vuln-${a.id}">
+            <td style="white-space: nowrap;">${new Date(a.timestamp).toLocaleString("fr-FR")}</td>
+            <td><strong>${a.hostname}</strong></td>
+            <td><span class="badge badge-anomaly" style="background: rgba(239, 68, 68, 0.15); color: var(--red);">CVE / OSV</span></td>
+            <td>
+                <div style="max-width:450px; word-wrap:break-word; font-family: var(--font-mono); font-size:12px;" title="${a.alert_message}">
+                    ${a.alert_message}
+                </div>
+            </td>
+            <td style="text-align: center;">
+                <div style="font-weight: 800; font-size: 14px; color: ${riskColor};">${risk}/100</div>
+            </td>
+            <td style="color: var(--text-primary); font-weight: 500;">${a.remediation_action || "Mettre à jour via apt/pip/npm"}</td>
+            <td>
+                <button class="btn-primary" 
+                        style="font-size:11px; padding:6px 10px; background: var(--green); border: none; color: #fff; font-weight: 600;" 
+                        onclick="dismissAlert('${a.id}')">
+                    Mise à jour faite
+                </button>
+            </td>
+        </tr>
+    `;
+    })
+    .join("");
+
+  tbody.innerHTML = `
+        <table class="alert-table">
+            <thead><tr>
+                <th>Détection</th>
+                <th>Serveur ciblé</th>
+                <th>Type</th>
+                <th>Composant & CVE Détectées</th>
+                <th style="text-align: center;">Sévérité</th>
+                <th>Action corrective</th>
+                <th>Résolution</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table>`;
+}
+
 async function dismissAlert(alertIdentifier) {
   const alertIndex = allAlerts.findIndex(
     (a) => a.id == alertIdentifier || a.pid == alertIdentifier,
@@ -226,8 +298,8 @@ function renderCharts() {
 
 function renderAll() {
   renderAlertsTable();
+  renderVulnerabilitiesTable();
   renderCharts();
 }
-
 refreshDashboard();
 setInterval(refreshDashboard, 30000);
