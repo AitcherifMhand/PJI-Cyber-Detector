@@ -10,7 +10,7 @@ async function refreshDashboard() {
 
 async function fetchAlerts() {
   try {
-    const resp = await fetch(`${API_BASE}/api/alerts/?limit=100`);
+    const resp = await fetch(`${API_BASE}/api/alerts/?limit=500`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     allAlerts = await resp.json();
     document.getElementById("status-dot").className = "status-dot green";

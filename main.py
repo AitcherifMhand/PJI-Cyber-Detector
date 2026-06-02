@@ -362,23 +362,8 @@ def receive_inventory(inventory: InventoryEntry):
 
 
 @app.get("/api/alerts/")
-def get_alerts(limit: int = 100, source: Optional[str] = None):
-    """Retourne les alertes — Wazuh en priorité, BDD en fallback."""
-    if WAZUH_API_URL:
-        try:
-            token = get_wazuh_token()
-            wazuh_alerts = get_wazuh_alerts(token, limit)
-            formatted = [format_wazuh_alert(a) for a in wazuh_alerts]
-            
-            # Filtre optionnel par source
-            if source:
-                formatted = [a for a in formatted if a.get("soc_source") == source]
-                
-            return formatted
-        except Exception as e:
-            print(f"[WARN] Wazuh inaccessible : {e} — fallback DB")
-
-    # Fallback PostgreSQL
+def get_alerts(limit: int = 100):
+    """Retourne les alertes"""
     try:
         conn = get_db_connection()
         cur  = conn.cursor(cursor_factory=RealDictCursor)
