@@ -1,4 +1,4 @@
-<group name="soc_cyberdetector,">
+<group name="soc_cyberdetector">
 
   <rule id="300001" level="10">
     <decoded_as>json</decoded_as>
@@ -7,7 +7,7 @@
   </rule>
 
   <rule id="300002" level="13">
-    <if_sid>100001</if_sid>
+    <if_sid>300001</if_sid>
     <field name="severity">CRITICAL</field>
     <description>SOC Cyber-Detector: anomalie CRITIQUE - $(alert_message)</description>
   </rule>

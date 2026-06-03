@@ -468,14 +468,3 @@ def _parse_ts(ts) -> datetime.datetime:
         except ValueError:
             pass
     return datetime.datetime.now()
-
-
-def _entropy(values: list) -> float:
-    """Entropie de Shannon sur une liste de valeurs discrètes."""
-    if not values:
-        return 0.0
-    counts = {}
-    for v in values:
-        counts[v] = counts.get(v, 0) + 1
-    n = len(values)
-    return -sum((c / n) * math.log2(c / n) for c in counts.values() if c > 0)

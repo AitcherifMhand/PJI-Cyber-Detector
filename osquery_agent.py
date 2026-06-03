@@ -174,7 +174,7 @@ def check_network_traffic():
         JOIN processes p ON s.pid = p.pid
         WHERE s.bytes_sent > 0
         GROUP BY s.pid, p.name
-        HAVING SUM(s.bytes_sent) > 50000
+        HAVING SUM(s.bytes_sent) > 10000000
     """
     for row in execute_osquery(query):
         pid = row.get('pid', 0)

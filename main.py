@@ -69,12 +69,6 @@ if WAZUH_SYSLOG_HOST:
 else:
     print("[INFO] WAZUH_SYSLOG_HOST non défini — syslog désactivé (fichier local uniquement)")
 
-
-
-# --- CONFIGURATION POSTGRESQL ---
-config = configparser.ConfigParser()
-config.read('db.config')
-
 DB_CONFIG = {
     "dbname": os.getenv("DB_NAME", "soc_db"),
     "user": os.getenv("DB_USER", "postgres"),
